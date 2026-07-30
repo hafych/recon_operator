@@ -2,7 +2,7 @@
 
 **A security-focused multi-tool recon control plane: Nmap engine, Kali inventory, review-only planner, encrypted results, and an operator dashboard.**
 
-[![CI](https://github.com/hafych/nmap-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/hafych/nmap-automator/actions/workflows/ci.yml)
+[![CI](https://github.com/hafych/recon_operator/actions/workflows/ci.yml/badge.svg)](https://github.com/hafych/recon_operator/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Nmap](https://img.shields.io/badge/scanner-Nmap-214478)](https://nmap.org/)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
@@ -40,8 +40,8 @@ Running one scanner is easy. Operating repeatable recon safely is harder. This p
 ### Docker Compose
 
 ```bash
-git clone https://github.com/hafych/nmap-automator.git
-cd nmap-automator
+git clone https://github.com/hafych/recon_operator.git
+cd recon_operator
 
 cp .env.example .env
 python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
@@ -393,12 +393,11 @@ Redis fence). Only the leader runs `periodic_scan` loops; other workers persist
 python -m pip install -r requirements-dev.txt
 ruff format --check .
 ruff check .
-python -m coverage run -m unittest discover -v
+python -m coverage run -m unittest discover -s tests/unit -t . -v
 python -m coverage report
 # Optional browser smoke + axe a11y (needs: python -m playwright install chromium)
-RUN_E2E=1 python -m unittest discover -s e2e -v
-bandit -q -ll -r . \
-  -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_scan_engine.py,./test_tool_inventory.py,./test_openapi_contract.py,./e2e
+RUN_E2E=1 python -m unittest discover -s tests/e2e -t . -v
+bandit -q -ll -r . -x ./.venv,./tests
 pip-audit -r requirements.txt
 ```
 
@@ -417,7 +416,8 @@ pip-audit -r requirements.txt
 | `tool_inventory.py` | Kali package and command inventory |
 | `recon_planner.py` | Service-aware multi-tool follow-up plans (review-only) |
 | `decrypt.py` | Fernet result decryption utility |
-| `test_*.py` / `e2e/` | Unit, contract, and browser regression tests |
+| `tests/unit/` | Unit, integration, and contract regression tests |
+| `tests/e2e/` | Playwright smoke and accessibility regression tests |
 
 Start the API with any of:
 
@@ -430,9 +430,6 @@ python -m recon_operator
 
 Bug reports, focused improvements, and platform-specific validation are welcome. Please read
 [CONTRIBUTING.md](CONTRIBUTING.md) and use private reporting for security vulnerabilities.
-
-Repository path may still be `nmap-automator` on GitHub for continuity; the product name is
-**Recon Operator**.
 
 ## License
 

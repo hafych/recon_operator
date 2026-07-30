@@ -7,6 +7,23 @@ from state_store import StateStore
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_memory_store_survives_across_method_connections(self):
+        store = StateStore(":memory:")
+        try:
+            store.insert_job(
+                {
+                    "job_id": "memory-job",
+                    "target": "127.0.0.1",
+                    "scan_type": "Ping",
+                    "status": "queued",
+                    "kind": "immediate",
+                    "created_at": "t0",
+                }
+            )
+            self.assertEqual(store.get_job("memory-job")["status"], "queued")
+        finally:
+            store.close()
+
     def test_connection_context_closes_after_transaction(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(os.path.join(tmp, "connection.db"))
@@ -57,7 +74,13 @@ class StateStoreTests(unittest.TestCase):
             )
             loaded = store.get_job("job-1")
             self.assertEqual(loaded["status"], "completed")
-            self.assertEqual(loaded["result"], {"hosts": []})
+            self.assertIsNone(loaded["result"])
+            with sqlite3.connect(store.path) as conn:
+                persisted_result = conn.execute(
+                    "SELECT result_json FROM scan_jobs WHERE job_id = 'job-1'"
+                ).fetchone()[0]
+            self.assertIsNone(persisted_result)
+            self.assertEqual(os.stat(store.path).st_mode & 0o777, 0o600)
             self.assertEqual(loaded["owner_id"], "owner-a")
             self.assertEqual(store.list_jobs(owner_id="owner-a")[0]["job_id"], "job-1")
             self.assertEqual(store.list_jobs(owner_id="owner-b"), [])
@@ -105,8 +128,11 @@ class StateStoreTests(unittest.TestCase):
                 started_at="t1",
             )
             self.assertIsNotNone(first)
-            self.assertEqual(first["status"], "running")
+            self.assertEqual(first["status"], "queued")
             self.assertEqual(first["lease_owner"], "worker-a")
+            running = store.mark_job_running("lease-1", "worker-a", started_at="t1")
+            self.assertIsNotNone(running)
+            self.assertEqual(running["status"], "running")
 
             second = store.try_claim_job(
                 "lease-1",
@@ -126,6 +152,7 @@ class StateStoreTests(unittest.TestCase):
                 started_at="t3",
             )
             self.assertIsNotNone(third)
+            self.assertEqual(third["status"], "queued")
             self.assertEqual(third["lease_owner"], "worker-b")
             # Keep lease-1 active so claim_next must pick a different job.
             self.assertTrue(
@@ -157,6 +184,96 @@ class StateStoreTests(unittest.TestCase):
             store.release_job_lease("lease-2", "worker-c")
             released = store.get_job("lease-2")
             self.assertIsNone(released.get("lease_owner"))
+
+    def test_terminal_updates_are_fenced_by_status_and_lease_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(os.path.join(tmp, "fence.db"))
+            store.insert_job(
+                {
+                    "job_id": "job",
+                    "target": "127.0.0.1",
+                    "scan_type": "Ping",
+                    "status": "queued",
+                    "kind": "immediate",
+                    "created_at": "t0",
+                }
+            )
+            claimed = store.try_claim_job(
+                "job",
+                "worker-a",
+                now=1,
+                lease_seconds=30,
+                started_at="t1",
+            )
+            self.assertIsNotNone(claimed)
+            self.assertIsNotNone(store.mark_job_running("job", "worker-a", started_at="t1"))
+            self.assertIsNone(
+                store.finalize_job(
+                    "job",
+                    "worker-b",
+                    status="completed",
+                    finished_at="t2",
+                    error=None,
+                    result_file="wrong.json",
+                )
+            )
+            cancelled, changed = store.cancel_job_if_active(
+                "job",
+                "owner-a",
+                finished_at="t2",
+                error="cancelled",
+            )
+            # An unowned legacy row is visible/cancellable, but completion can
+            # no longer resurrect it after the terminal transition.
+            self.assertTrue(changed)
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertIsNone(
+                store.finalize_job(
+                    "job",
+                    "worker-a",
+                    status="completed",
+                    finished_at="t3",
+                    error=None,
+                    result_file="late.json",
+                )
+            )
+            self.assertEqual(store.get_job("job")["status"], "cancelled")
+
+    def test_capacity_and_scheduled_deduplication_are_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(os.path.join(tmp, "capacity.db"))
+            first = {
+                "job_id": "one",
+                "target": "127.0.0.1",
+                "scan_type": "Ping",
+                "status": "queued",
+                "kind": "scheduled",
+                "owner_id": "owner",
+                "created_at": "t0",
+            }
+            accepted, inserted = store.insert_job_with_capacity(
+                first,
+                max_active=1,
+                dedupe_active=True,
+            )
+            self.assertTrue(inserted)
+            self.assertEqual(accepted["job_id"], "one")
+
+            duplicate, inserted_duplicate = store.insert_job_with_capacity(
+                {**first, "job_id": "two", "created_at": "t1"},
+                max_active=1,
+                dedupe_active=True,
+            )
+            self.assertFalse(inserted_duplicate)
+            self.assertEqual(duplicate["job_id"], "one")
+
+            rejected, inserted_rejected = store.insert_job_with_capacity(
+                {**first, "job_id": "three", "target": "127.0.0.2"},
+                max_active=1,
+                dedupe_active=True,
+            )
+            self.assertIsNone(rejected)
+            self.assertFalse(inserted_rejected)
 
     def test_leadership_is_exclusive_until_expired(self):
         with tempfile.TemporaryDirectory() as tmp:

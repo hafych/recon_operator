@@ -192,6 +192,7 @@ class PlaybookHttpTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         self.assertEqual(final["status"], "failed")
         self.assertEqual(final["steps"][0]["status"], "failed")
+        self.assertEqual(final["steps"][1]["status"], "skipped")
 
 
 if __name__ == "__main__":

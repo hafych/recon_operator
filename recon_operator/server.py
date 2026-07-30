@@ -1,6 +1,8 @@
 """Recon Operator server implementation (package entry for routes, jobs, auth)."""
 
 import asyncio
+import fcntl
+import hashlib
 import ipaddress
 import json
 import logging
@@ -54,9 +56,12 @@ from scan_engine import (
     NmapTimeoutError,
     ScanCancelledError,
     available_discovery_engines,
+    clear_process_token,
     diff_scan_results,
     import_nmap_xml,
     kill_active_process,
+    mark_process_cancelled,
+    prepare_process_token,
     run_nmap_scan,
     supported_scan_types,
     validate_discovery,
@@ -84,6 +89,10 @@ curl -H "X-API-KEY: $API_TOKEN" http://127.0.0.1:5000/jobs/<job_id>
 
 
 start_time = datetime.now(timezone.utc)
+
+
+class JobCancelledError(RuntimeError):
+    """A scan job reached the cancelled domain state."""
 
 # --- Config surface (source of truth: recon_operator.config) ---
 VERSION = _config.VERSION
@@ -213,7 +222,9 @@ app = Quart(
     static_folder=str(_STATIC_DIR),
     static_url_path="/static",
 )
-app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BODY_BYTES
+# Quart applies this ceiling before route dispatch. Use the largest supported
+# body here; a route-aware hook below keeps ordinary JSON at the lower limit.
+app.config["MAX_CONTENT_LENGTH"] = max(MAX_REQUEST_BODY_BYTES, MAX_IMPORT_XML_BYTES)
 scan_tasks: Dict[str, asyncio.Task] = {}
 scan_jobs: Dict[str, Dict[str, Any]] = {}
 engagements: Dict[str, Dict[str, Any]] = {}
@@ -225,6 +236,27 @@ _scan_semaphore: Optional[asyncio.Semaphore] = None
 _jobs_lock = asyncio.Lock()
 _engagements_lock = asyncio.Lock()
 state_store = StateStore(STATE_DB_PATH)
+
+
+@app.before_request
+async def _enforce_route_body_limit():
+    if request.method not in {"POST", "PUT", "PATCH"}:
+        return None
+    if request.path == "/results/import":
+        return None
+    content_length = request.content_length
+    if content_length is not None and content_length > MAX_REQUEST_BODY_BYTES:
+        return jsonify({"error": "Request body too large"}), 413
+    if content_length is None:
+        body = await request.get_data(cache=True)
+        if len(body) > MAX_REQUEST_BODY_BYTES:
+            return jsonify({"error": "Request body too large"}), 413
+    return None
+
+
+@app.errorhandler(413)
+async def _request_too_large(_error):
+    return jsonify({"error": "Request body too large"}), 413
 
 SUPPORTED_SCAN_TYPES = {name: name for name in supported_scan_types()}
 RESULT_FILENAME_RE = re.compile(
@@ -359,6 +391,8 @@ def record_audit_event(
 
 def _validate_scan_payload(
     payload: Optional[Dict],
+    *,
+    validate_interval: bool = True,
 ) -> Tuple[
     Optional[str],
     Optional[str],
@@ -405,8 +439,18 @@ def _validate_scan_payload(
     discovery, discovery_error = validate_discovery(payload.get("discovery"))
     if discovery_error:
         return target, scan_type, None, None, None, None, discovery_error
+    if discovery not in (None, "none") and scan_type in {"UDP", "Ping"}:
+        return (
+            target,
+            scan_type,
+            None,
+            ports,
+            scripts,
+            discovery,
+            f"discovery is TCP-only and cannot be combined with {scan_type}",
+        )
 
-    interval = payload.get("interval", 30)
+    interval = payload.get("interval", 30) if validate_interval else None
     interval_value = None
     if interval is not None:
         if isinstance(interval, bool) or not isinstance(interval, (int, float)):
@@ -500,7 +544,12 @@ def _validate_scan_payload(
 
 def owner_result_prefix(owner_id: Optional[str] = None) -> str:
     value = owner_id or current_owner_id()
-    return f"o{value[:12]}_"
+    normalized = (
+        value.lower()
+        if re.fullmatch(r"[a-fA-F0-9]{12,64}", value)
+        else hashlib.sha256(value.encode("utf-8")).hexdigest()
+    )
+    return f"o{normalized[:12]}_"
 
 
 def result_visible_to_owner(filename: str, owner_id: Optional[str] = None) -> bool:
@@ -514,7 +563,7 @@ def result_visible_to_owner(filename: str, owner_id: Optional[str] = None) -> bo
     match = OWNER_RESULT_PREFIX_RE.match(filename)
     if not match:
         return LEGACY_RESULTS_SHARED
-    return match.group(1) == owner[:12]
+    return match.group(1) == owner_result_prefix(owner)[1:13]
 
 
 def job_visible_to_owner(job: Dict[str, Any], owner_id: Optional[str] = None) -> bool:
@@ -525,7 +574,8 @@ def job_visible_to_owner(job: Dict[str, Any], owner_id: Optional[str] = None) ->
 
 def make_task_id(target: str, scan_type: str, owner_id: Optional[str] = None) -> str:
     owner = owner_id or current_owner_id()
-    return f"o{owner[:12]}-{target}-{scan_type}"
+    owner_prefix = owner_result_prefix(owner)[1:13]
+    return f"o{owner_prefix}-{target}-{scan_type}"
 
 
 def _peer_is_trusted_proxy(peer: str) -> bool:
@@ -955,11 +1005,20 @@ def _result_files() -> List[Path]:
     directory = Path(RESULTS_DIR)
     if not directory.is_dir():
         return []
-    return sorted(
-        (path for path in directory.iterdir() if path.is_file() and path.suffix == ".json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
+    existing: List[Tuple[float, Path]] = []
+    try:
+        candidates = list(directory.iterdir())
+    except OSError:
+        return []
+    for path in candidates:
+        try:
+            if path.is_file() and path.suffix == ".json":
+                existing.append((path.stat().st_mtime, path))
+        except OSError:
+            # Retention may remove a file between enumeration and stat.
+            continue
+    existing.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in existing]
 
 
 def apply_results_retention(directory: Optional[str] = None) -> Dict[str, int]:
@@ -968,31 +1027,42 @@ def apply_results_retention(directory: Optional[str] = None) -> Dict[str, int]:
     if not root.is_dir():
         return {"deleted": 0, "remaining": 0}
 
-    files = [path for path in root.iterdir() if path.is_file() and path.suffix == ".json"]
-    deleted = 0
-    now = time.time()
+    lock_path = root / ".retention.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        files = [path for path in root.iterdir() if path.is_file() and path.suffix == ".json"]
+        deleted = 0
+        now = time.time()
 
-    if RESULTS_MAX_AGE_DAYS > 0:
-        max_age_seconds = RESULTS_MAX_AGE_DAYS * 86400
-        for path in list(files):
+        if RESULTS_MAX_AGE_DAYS > 0:
+            max_age_seconds = RESULTS_MAX_AGE_DAYS * 86400
+            for path in list(files):
+                try:
+                    if now - path.stat().st_mtime > max_age_seconds:
+                        path.unlink()
+                        deleted += 1
+                        files.remove(path)
+                except OSError as exc:
+                    log_event(f"Retention age cleanup failed for {path}: {exc}")
+
+        existing = []
+        for path in files:
             try:
-                if now - path.stat().st_mtime > max_age_seconds:
-                    path.unlink()
-                    deleted += 1
-                    files.remove(path)
+                existing.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        existing.sort(key=lambda item: item[0])
+        files = [path for _, path in existing]
+        while len(files) > RESULTS_MAX_FILES:
+            path = files.pop(0)
+            try:
+                path.unlink()
+                deleted += 1
             except OSError as exc:
-                log_event(f"Retention age cleanup failed for {path}: {exc}")
+                log_event(f"Retention count cleanup failed for {path}: {exc}")
 
-    files.sort(key=lambda path: path.stat().st_mtime)
-    while len(files) > RESULTS_MAX_FILES:
-        path = files.pop(0)
-        try:
-            path.unlink()
-            deleted += 1
-        except OSError as exc:
-            log_event(f"Retention count cleanup failed for {path}: {exc}")
-
-    return {"deleted": deleted, "remaining": len(files)}
+        return {"deleted": deleted, "remaining": len(files)}
 
 
 def _write_encrypted_result(path: str, encrypted_data: bytes) -> None:
@@ -1025,15 +1095,31 @@ async def save_scan_results_async(
         return None
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    safe_target = "".join(c if c.isalnum() or c in [".", "_", "-"] else "_" for c in target)[:120]
+    safe_target = (
+        "".join(c if c.isalnum() or c in [".", "_", "-"] else "_" for c in str(target))[:120]
+        or "target"
+    )
+    safe_scan_type = (
+        "".join(c if c.isalnum() or c in ["_", "-"] else "_" for c in str(scan_type))[:40] or "Scan"
+    )
     owner = owner_id or "local"
-    filename = f"{owner_result_prefix(owner)}{safe_target}_{scan_type}_{timestamp}.json"
-    path = os.path.join(RESULTS_DIR, filename)
+    filename = f"{owner_result_prefix(owner)}{safe_target}_{safe_scan_type}_{timestamp}.json"
+    results_root = Path(RESULTS_DIR).resolve()
+    path = (results_root / filename).resolve()
+    try:
+        path.relative_to(results_root)
+    except ValueError as exc:
+        raise ValueError("Result filename escaped RESULTS_DIR") from exc
 
     try:
         encrypted_data = cipher.encrypt(json.dumps(results, indent=2).encode())
-        await asyncio.to_thread(_write_encrypted_result, path, encrypted_data)
-        await asyncio.to_thread(apply_results_retention, RESULTS_DIR)
+        await asyncio.to_thread(_write_encrypted_result, str(path), encrypted_data)
+        try:
+            await asyncio.to_thread(apply_results_retention, RESULTS_DIR)
+        except Exception as exc:
+            # The encrypted result is already durable; maintenance failure
+            # must not turn a successful scan into a failed job.
+            log_event(f"Result retention failed after saving {filename}: {exc}")
         log_event(f"Results saved to {path}")
         await send_telegram_message(f"Scan {target} finished. Results: {filename}")
         return filename
@@ -1042,6 +1128,26 @@ async def save_scan_results_async(
         log_event(err)
         await send_telegram_message(f"Error saving results for {target}: {e}")
         raise
+
+
+async def _load_job_result_payload(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Load a completed job result from memory or its encrypted result file."""
+    result = job.get("result")
+    if isinstance(result, dict):
+        return result
+    result_file = job.get("result_file")
+    if not isinstance(result_file, str) or os.path.basename(result_file) != result_file:
+        return None
+    root = Path(RESULTS_DIR).resolve()
+    path = (root / result_file).resolve()
+    try:
+        path.relative_to(root)
+        encrypted = await asyncio.to_thread(path.read_bytes)
+        plaintext = cipher.decrypt(encrypted)
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (InvalidToken, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _job_public_view(job: Dict[str, Any], *, include_result: bool = True) -> Dict[str, Any]:
@@ -1067,11 +1173,9 @@ def _job_public_view(job: Dict[str, Any], *, include_result: bool = True) -> Dic
 
 
 def _persist_job(job: Dict[str, Any]) -> None:
-    try:
-        state_store.upsert_job(job)
-        state_store.prune_jobs(MAX_SCAN_JOBS)
-    except Exception as exc:
-        log_event(f"Failed to persist job {job.get('job_id')}: {exc}")
+    """Persist compatibility state and propagate failures to the caller."""
+    state_store.upsert_job(job)
+    state_store.prune_jobs(MAX_SCAN_JOBS)
 
 
 def _try_redis_job_lease(job_id: str, *, renew: bool = False) -> bool:
@@ -1182,9 +1286,28 @@ def _note_job_terminal_metrics(job: Dict[str, Any], *, previous_status: Any, sta
             scan_type=scan_type,
             status=str(status),
         )
+        return
+    # Monotonic timestamps are process-local. A reclaimed job or a terminal
+    # update observed by another worker still has durable UTC timestamps.
+    try:
+        started_at = datetime.fromisoformat(str(job.get("started_at")))
+        finished_at = datetime.fromisoformat(str(job.get("finished_at")))
+        duration = (finished_at - started_at).total_seconds()
+    except (TypeError, ValueError):
+        return
+    METRICS.observe(
+        "recon_operator_scan_duration_seconds",
+        max(0.0, duration),
+        scan_type=scan_type,
+        status=str(status),
+    )
 
 
 async def _set_job_fields(job_id: str, **fields: Any) -> None:
+    """Compatibility helper for non-runner callers and test doubles.
+
+    The real runner uses the fenced start/finalize helpers below.
+    """
     async with _jobs_lock:
         job = scan_jobs.get(job_id)
         if not job:
@@ -1201,6 +1324,100 @@ async def _set_job_fields(job_id: str, **fields: Any) -> None:
                 status=str(fields.get("status") or "unknown"),
             )
         _persist_job(job)
+
+
+async def _refresh_job_from_store(job_id: str) -> Optional[Dict[str, Any]]:
+    """Refresh durable fields while preserving only process-local state."""
+    stored = await asyncio.to_thread(state_store.get_job, job_id)
+    async with _jobs_lock:
+        current = scan_jobs.get(job_id)
+        if stored is None:
+            return current
+        task = (current or {}).get("task")
+        result = None
+        if (
+            current
+            and stored.get("status") == "completed"
+            and current.get("status") == "completed"
+            and current.get("result_file") == stored.get("result_file")
+        ):
+            result = current.get("result")
+        merged = {**stored, "task": task, "result": result}
+        scan_jobs[job_id] = merged
+        return merged
+
+
+async def _mark_job_running(job_id: str) -> bool:
+    started_at = _utc_now_iso()
+    stored = await asyncio.to_thread(
+        state_store.mark_job_running,
+        job_id,
+        WORKER_ID,
+        started_at=started_at,
+    )
+    if stored is None:
+        await _refresh_job_from_store(job_id)
+        return False
+    async with _jobs_lock:
+        current = scan_jobs.get(job_id)
+        task = (current or {}).get("task")
+        stored["task"] = task
+        stored["_metrics_started_mono"] = time.monotonic()
+        scan_jobs[job_id] = stored
+    return True
+
+
+async def _finalize_job(
+    job_id: str,
+    *,
+    status: str,
+    error: Optional[str],
+    result_file: Optional[str] = None,
+    result: Optional[Dict[str, Any]] = None,
+) -> bool:
+    finished_at = _utc_now_iso()
+    stored = await asyncio.to_thread(
+        state_store.finalize_job,
+        job_id,
+        WORKER_ID,
+        status=status,
+        finished_at=finished_at,
+        error=error,
+        result_file=result_file,
+    )
+    if stored is None:
+        await _refresh_job_from_store(job_id)
+        return False
+    async with _jobs_lock:
+        current = scan_jobs.get(job_id)
+        previous_status = (current or {}).get("status")
+        task = (current or {}).get("task")
+        started_mono = (current or {}).get("_metrics_started_mono")
+        stored["task"] = task
+        stored["result"] = result if status == "completed" else None
+        if started_mono is not None:
+            stored["_metrics_started_mono"] = started_mono
+        scan_jobs[job_id] = stored
+        _note_job_terminal_metrics(stored, previous_status=previous_status, status=status)
+    return True
+
+
+def _delete_saved_result(result_file: Optional[str]) -> None:
+    """Remove an uncommitted result created after a lost terminal-state race."""
+    if not result_file or os.path.basename(result_file) != result_file:
+        return
+    root = Path(RESULTS_DIR).resolve()
+    candidate = (root / result_file).resolve()
+    try:
+        candidate.relative_to(root)
+        candidate.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+
+
+def _request_job_process_cancel(job_id: str) -> bool:
+    mark_process_cancelled(job_id)
+    return kill_active_process(job_id)
 
 
 async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
@@ -1242,54 +1459,79 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             owner_id = job.get("owner_id") or "local"
 
     loop = asyncio.get_running_loop()
+    runner_task = asyncio.current_task()
     heartbeat: Optional[asyncio.Task] = None
+    lease_lost = False
+    executor_submitted = False
+    prepare_process_token(job_id)
+
+    def _execute_scan() -> Dict[str, Any]:
+        try:
+            return scan_network(
+                target,
+                scan_type,
+                ports=ports,
+                scripts=scripts,
+                discovery=discovery,
+                process_token=job_id,
+            )
+        finally:
+            clear_process_token(job_id)
 
     async def _lease_heartbeat() -> None:
-        interval = max(5.0, JOB_LEASE_SECONDS / 3)
+        nonlocal lease_lost
+        interval = min(5.0, max(0.05, JOB_LEASE_SECONDS / 3))
         while True:
             await asyncio.sleep(interval)
             ok = await asyncio.to_thread(_renew_job_lease, job_id)
             if not ok:
-                log_event(f"Lost job lease for {job_id}; stopping heartbeat")
+                lease_lost = True
+                log_event(f"Lost job lease for {job_id}; stopping scan")
+                _request_job_process_cancel(job_id)
+                if runner_task is not None and not runner_task.done():
+                    runner_task.cancel()
                 return
 
     try:
         heartbeat = asyncio.create_task(_lease_heartbeat())
         async with _get_scan_semaphore():
-            await _set_job_fields(
-                job_id,
-                status="running",
-                started_at=_utc_now_iso(),
-                _metrics_started_mono=time.monotonic(),
-            )
+            if not await _mark_job_running(job_id):
+                return
+            executor_future = loop.run_in_executor(None, _execute_scan)
+            executor_submitted = True
             results = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: scan_network(
-                        target,
-                        scan_type,
-                        ports=ports,
-                        scripts=scripts,
-                        discovery=discovery,
-                        process_token=job_id,
-                    ),
-                ),
+                executor_future,
                 timeout=SCAN_TIMEOUT_SECONDS + 5,
             )
-        # If cancel won the race, do not overwrite cancelled status with completed.
+        # Recheck the durable fence before writing results: another worker may
+        # have cancelled the job or taken ownership since the last heartbeat.
+        stored = await asyncio.to_thread(state_store.get_job, job_id)
         async with _jobs_lock:
             current = scan_jobs.get(job_id)
+            durable_conflict = bool(
+                stored
+                and (
+                    stored.get("status") in _TERMINAL_JOB_STATUSES
+                    or stored.get("lease_owner") not in (None, WORKER_ID)
+                )
+            )
+            if durable_conflict:
+                current_task = (current or {}).get("task")
+                scan_jobs[job_id] = {**stored, "task": current_task}
+                return
             if current and current.get("status") == "cancelled":
                 return
         result_file = await save_scan_results_async(results, target, scan_type, owner_id=owner_id)
-        await _set_job_fields(
+        committed = await _finalize_job(
             job_id,
             status="completed",
-            finished_at=_utc_now_iso(),
-            result=results,
-            result_file=result_file,
             error=None,
+            result_file=result_file,
+            result=results,
         )
+        if not committed:
+            await asyncio.to_thread(_delete_saved_result, result_file)
+            return
         record_audit_event(
             "scan.finish",
             target=target,
@@ -1300,102 +1542,107 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             actor_owner_prefix=(owner_id[:12] if owner_id else None),
         )
     except asyncio.CancelledError:
-        kill_active_process(job_id)
-        await _set_job_fields(
-            job_id,
-            status="cancelled",
-            finished_at=_utc_now_iso(),
-            error="Scan cancelled",
-        )
-        record_audit_event(
-            "scan.finish",
-            target=target,
-            scan_type=scan_type,
-            job_id=job_id,
-            status="cancelled",
-            actor_owner_prefix=(owner_id[:12] if owner_id else None),
-        )
+        _request_job_process_cancel(job_id)
+        if lease_lost:
+            # The durable row is authoritative: another worker may now own it,
+            # or a different worker may already have recorded user cancellation.
+            stored = await asyncio.to_thread(state_store.get_job, job_id)
+            async with _jobs_lock:
+                current_task = (scan_jobs.get(job_id) or {}).get("task")
+                if stored is not None:
+                    scan_jobs[job_id] = {**stored, "task": current_task}
+        else:
+            committed = await _finalize_job(
+                job_id,
+                status="cancelled",
+                error="Scan cancelled",
+            )
+            if committed:
+                record_audit_event(
+                    "scan.finish",
+                    target=target,
+                    scan_type=scan_type,
+                    job_id=job_id,
+                    status="cancelled",
+                    actor_owner_prefix=(owner_id[:12] if owner_id else None),
+                )
         raise
     except ScanCancelledError:
-        await _set_job_fields(
+        committed = await _finalize_job(
             job_id,
             status="cancelled",
-            finished_at=_utc_now_iso(),
             error="Scan cancelled",
         )
-        record_audit_event(
-            "scan.finish",
-            target=target,
-            scan_type=scan_type,
-            job_id=job_id,
-            status="cancelled",
-            actor_owner_prefix=(owner_id[:12] if owner_id else None),
-        )
+        if committed:
+            record_audit_event(
+                "scan.finish",
+                target=target,
+                scan_type=scan_type,
+                job_id=job_id,
+                status="cancelled",
+                actor_owner_prefix=(owner_id[:12] if owner_id else None),
+            )
     except asyncio.TimeoutError:
-        kill_active_process(job_id)
+        _request_job_process_cancel(job_id)
         err = f"Scan timeout for {target} ({scan_type})"
         log_event(err, job_id=job_id)
-        await send_telegram_message(err)
-        await _set_job_fields(
+        committed = await _finalize_job(
             job_id,
             status="timeout",
-            finished_at=_utc_now_iso(),
             error=err,
         )
-        record_audit_event(
-            "scan.finish",
-            target=target,
-            scan_type=scan_type,
-            job_id=job_id,
-            status="timeout",
-            actor_owner_prefix=(owner_id[:12] if owner_id else None),
-        )
+        if committed:
+            await send_telegram_message(err)
+            record_audit_event(
+                "scan.finish",
+                target=target,
+                scan_type=scan_type,
+                job_id=job_id,
+                status="timeout",
+                actor_owner_prefix=(owner_id[:12] if owner_id else None),
+            )
     except TimeoutError as exc:
-        kill_active_process(job_id)
+        _request_job_process_cancel(job_id)
         err = str(exc)
         log_event(err, job_id=job_id)
-        await send_telegram_message(err)
-        await _set_job_fields(
+        committed = await _finalize_job(
             job_id,
             status="timeout",
-            finished_at=_utc_now_iso(),
             error=err,
         )
-        record_audit_event(
-            "scan.finish",
-            target=target,
-            scan_type=scan_type,
-            job_id=job_id,
-            status="timeout",
-            actor_owner_prefix=(owner_id[:12] if owner_id else None),
-        )
+        if committed:
+            await send_telegram_message(err)
+            record_audit_event(
+                "scan.finish",
+                target=target,
+                scan_type=scan_type,
+                job_id=job_id,
+                status="timeout",
+                actor_owner_prefix=(owner_id[:12] if owner_id else None),
+            )
     except (NmapNotFoundError, NmapScanError, Exception) as exc:
-        # Prefer cancelled if cancel_job already won.
-        async with _jobs_lock:
-            current = scan_jobs.get(job_id)
-            already_cancelled = bool(current and current.get("status") == "cancelled")
-        if already_cancelled:
-            return
         err = f"Scan error for {target} ({scan_type}): {exc}"
         log_event(err, job_id=job_id)
-        await send_telegram_message(err)
-        await _set_job_fields(
+        committed = await _finalize_job(
             job_id,
             status="failed",
-            finished_at=_utc_now_iso(),
             error=str(exc),
         )
-        record_audit_event(
-            "scan.finish",
-            target=target,
-            scan_type=scan_type,
-            job_id=job_id,
-            status="failed",
-            detail=str(exc)[:200],
-            actor_owner_prefix=(owner_id[:12] if owner_id else None),
-        )
+        if committed:
+            await send_telegram_message(err)
+            record_audit_event(
+                "scan.finish",
+                target=target,
+                scan_type=scan_type,
+                job_id=job_id,
+                status="failed",
+                detail=str(exc)[:200],
+                actor_owner_prefix=(owner_id[:12] if owner_id else None),
+            )
     finally:
         kill_active_process(job_id)
+        if not executor_submitted:
+            clear_process_token(job_id)
         if heartbeat is not None:
             heartbeat.cancel()
             try:
@@ -1404,12 +1651,11 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
                 pass
         await asyncio.to_thread(state_store.release_job_lease, job_id, WORKER_ID)
         _release_redis_job_lease(job_id)
+        await _refresh_job_from_store(job_id)
         async with _jobs_lock:
             job = scan_jobs.get(job_id)
             if job:
                 job["task"] = None
-                job["lease_owner"] = None
-                job["lease_until"] = None
             await _prune_jobs_locked()
 
 
@@ -1419,21 +1665,14 @@ async def _adopt_claimed_job(claimed: Dict[str, Any]) -> None:
     async with _jobs_lock:
         existing = scan_jobs.get(job_id)
         if existing and existing.get("task") is not None and not existing["task"].done():
+            # The already-registered local runner can consume this worker's
+            # queued lease through try_claim_job; do not create a second task.
             return
         active = sum(1 for job in scan_jobs.values() if job["status"] in {"queued", "running"})
         if active >= MAX_SCAN_JOBS and job_id not in scan_jobs:
             # Capacity full — release so another worker can take it later.
             try:
-                state_store.release_job_lease(job_id, WORKER_ID)
-                state_store.upsert_job(
-                    {
-                        **claimed,
-                        "status": "queued",
-                        "lease_owner": None,
-                        "lease_until": None,
-                        "started_at": None,
-                    }
-                )
+                state_store.requeue_owned_job(job_id, WORKER_ID)
             except Exception as exc:
                 log_event(f"Failed to requeue capacity-limited job {job_id}: {exc}")
             _release_redis_job_lease(job_id)
@@ -1461,20 +1700,14 @@ async def job_claim_loop(stop_event: Optional[asyncio.Event] = None) -> None:
             if claimed is not None:
                 # Align Redis fence with SQLite claim.
                 if not _try_redis_job_lease(claimed["job_id"]):
-                    await asyncio.to_thread(
-                        state_store.release_job_lease, claimed["job_id"], WORKER_ID
-                    )
                     try:
-                        state_store.upsert_job(
-                            {
-                                **claimed,
-                                "status": "queued",
-                                "lease_owner": None,
-                                "lease_until": None,
-                            }
+                        await asyncio.to_thread(
+                            state_store.requeue_owned_job,
+                            claimed["job_id"],
+                            WORKER_ID,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_event(f"Failed to release Redis-rejected job claim: {exc}")
                 else:
                     await _adopt_claimed_job(claimed)
                     continue
@@ -1498,10 +1731,6 @@ async def create_scan_job(
     owner = owner_id or current_owner_id()
     async with _jobs_lock:
         await _prune_jobs_locked()
-        active = sum(1 for job in scan_jobs.values() if job["status"] in {"queued", "running"})
-        if active >= MAX_SCAN_JOBS:
-            raise RuntimeError("Scan job capacity reached")
-
         job_id = str(uuid.uuid4())
         job = {
             "job_id": job_id,
@@ -1523,8 +1752,27 @@ async def create_scan_job(
             "lease_until": None,
             "task": None,
         }
+        # Capacity and scheduled-occurrence deduplication must be shared across
+        # workers; a per-process dictionary check admits races.
+        accepted, inserted = await asyncio.to_thread(
+            state_store.insert_job_with_capacity,
+            job,
+            max_active=MAX_SCAN_JOBS,
+            dedupe_active=kind == "scheduled",
+        )
+        if accepted is None:
+            raise RuntimeError("Scan job capacity reached")
+        if not inserted:
+            existing_task = (scan_jobs.get(accepted["job_id"]) or {}).get("task")
+            accepted["task"] = existing_task
+            scan_jobs[accepted["job_id"]] = accepted
+            return _job_public_view(accepted, include_result=False)
+        try:
+            await asyncio.to_thread(state_store.prune_jobs, MAX_SCAN_JOBS)
+        except Exception as exc:
+            # Retention maintenance must not invalidate an accepted durable job.
+            log_event(f"Failed to prune jobs after inserting {job_id}: {exc}")
         scan_jobs[job_id] = job
-        _persist_job(job)
         # Low-latency local attempt; claim ensures only one worker executes.
         task = asyncio.create_task(_run_scan_job(job_id))
         job["task"] = task
@@ -1556,12 +1804,13 @@ async def async_scan(
     scripts: Optional[str] = None,
     discovery: Optional[str] = None,
     owner_id: Optional[str] = None,
+    kind: str = "immediate",
 ) -> dict:
     """Run a scan and wait for completion (used by scheduled scans)."""
     job = await create_scan_job(
         target,
         scan_type,
-        kind="scheduled",
+        kind=kind,
         ports=ports,
         scripts=scripts,
         discovery=discovery,
@@ -1569,20 +1818,19 @@ async def async_scan(
     )
     job_id = job["job_id"]
     while True:
-        async with _jobs_lock:
-            current = scan_jobs.get(job_id)
-            if not current:
-                raise RuntimeError("Scan job disappeared")
-            status = current["status"]
-            if status in {"completed", "failed", "cancelled", "timeout"}:
-                if status == "completed":
-                    return current.get("result") or {}
-                if status == "timeout":
-                    raise TimeoutError(current.get("error") or "Scan timed out")
-                if status == "cancelled":
-                    raise asyncio.CancelledError()
-                raise RuntimeError(current.get("error") or "Scan failed")
-            task = current.get("task")
+        current = await _refresh_job_from_store(job_id)
+        if not current:
+            raise RuntimeError("Scan job disappeared")
+        status = current["status"]
+        if status in {"completed", "failed", "cancelled", "timeout"}:
+            if status == "completed":
+                return await _load_job_result_payload(current) or {}
+            if status == "timeout":
+                raise TimeoutError(current.get("error") or "Scan timed out")
+            if status == "cancelled":
+                raise JobCancelledError(current.get("error") or "Scan cancelled")
+            raise RuntimeError(current.get("error") or "Scan failed")
+        task = current.get("task")
         if task is not None:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
@@ -1621,13 +1869,31 @@ async def _wait_job_terminal(job_id: str) -> Dict[str, Any]:
     """Poll until a job reaches a terminal status; return the job dict."""
     terminal = _TERMINAL_JOB_STATUSES
     while True:
-        async with _jobs_lock:
-            current = scan_jobs.get(job_id)
-        if current is None:
-            current = await asyncio.to_thread(state_store.get_job, job_id)
+        stored = await asyncio.to_thread(state_store.get_job, job_id)
+        if stored is None:
+            return {
+                "job_id": job_id,
+                "status": "failed",
+                "error": "Scan job disappeared from durable state",
+                "result_file": None,
+            }
+        current = await _refresh_job_from_store(job_id)
         if current and current.get("status") in terminal:
             return current
         await asyncio.sleep(0.1)
+
+
+def _skip_engagement_tail(
+    steps: List[Dict[str, Any]],
+    *,
+    after_index: int,
+    reason: str,
+) -> None:
+    """Make terminal playbook state explicit for phases that will never run."""
+    for later in steps[after_index + 1 :]:
+        if isinstance(later, dict) and later.get("status") == "pending":
+            later["status"] = "skipped"
+            later["error"] = reason
 
 
 async def _run_engagement(engagement_id: str) -> None:
@@ -1641,6 +1907,8 @@ async def _run_engagement(engagement_id: str) -> None:
         owner = eng.get("owner_id") or "local"
         target = eng.get("target")
 
+    active_job_id: Optional[str] = None
+    active_step_index = -1
     try:
         for index, step in enumerate(steps):
             if not isinstance(step, dict):
@@ -1651,6 +1919,7 @@ async def _run_engagement(engagement_id: str) -> None:
                     return
                 eng["current_index"] = index
                 step["status"] = "running"
+                active_step_index = index
             payload = {
                 "target": target,
                 "preset": step.get("phase"),
@@ -1661,6 +1930,11 @@ async def _run_engagement(engagement_id: str) -> None:
                     step["status"] = "failed"
                     step["error"] = err or "preset failed"
                     eng["status"] = "failed"
+                    _skip_engagement_tail(
+                        steps,
+                        after_index=index,
+                        reason="Skipped after an earlier phase failed",
+                    )
                 return
             try:
                 job = await create_scan_job(
@@ -1677,6 +1951,11 @@ async def _run_engagement(engagement_id: str) -> None:
                     step["status"] = "failed"
                     step["error"] = str(exc)
                     eng["status"] = "failed"
+                    _skip_engagement_tail(
+                        steps,
+                        after_index=index,
+                        reason="Skipped after an earlier phase failed",
+                    )
                 log_event(
                     f"Playbook step failed to queue: {exc}",
                     engagement_id=engagement_id,
@@ -1684,15 +1963,30 @@ async def _run_engagement(engagement_id: str) -> None:
                 )
                 return
             job_id = job.get("job_id")
+            active_job_id = str(job_id) if job_id else None
             async with _engagements_lock:
                 step["job_id"] = job_id
             finished = await _wait_job_terminal(str(job_id))
+            active_job_id = None
             async with _engagements_lock:
                 step["status"] = finished.get("status") or "failed"
                 step["result_file"] = finished.get("result_file")
                 step["error"] = finished.get("error")
                 if finished.get("status") != "completed":
-                    eng["status"] = "failed"
+                    eng["status"] = (
+                        "cancelled"
+                        if finished.get("status") == "cancelled"
+                        else "failed"
+                    )
+                    _skip_engagement_tail(
+                        steps,
+                        after_index=index,
+                        reason=(
+                            "Skipped because the playbook was cancelled"
+                            if eng["status"] == "cancelled"
+                            else "Skipped after an earlier phase failed"
+                        ),
+                    )
                     log_event(
                         f"Playbook stopped after phase {step.get('phase')}",
                         engagement_id=engagement_id,
@@ -1713,16 +2007,38 @@ async def _run_engagement(engagement_id: str) -> None:
                 eng["current_index"] = len(steps)
         log_event(f"Playbook completed {engagement_id}", engagement_id=engagement_id)
     except asyncio.CancelledError:
+        if active_job_id:
+            await _cancel_scan_job(active_job_id, owner_id=str(owner))
         async with _engagements_lock:
             eng = engagements.get(engagement_id)
             if eng:
                 eng["status"] = "cancelled"
+                if 0 <= active_step_index < len(steps):
+                    active_step = steps[active_step_index]
+                    if active_step.get("status") == "running":
+                        active_step["status"] = "cancelled"
+                        active_step["error"] = "Playbook cancelled"
+                _skip_engagement_tail(
+                    steps,
+                    after_index=active_step_index,
+                    reason="Skipped because the playbook was cancelled",
+                )
         raise
     except Exception as exc:
         async with _engagements_lock:
             eng = engagements.get(engagement_id)
             if eng:
                 eng["status"] = "failed"
+                if 0 <= active_step_index < len(steps):
+                    active_step = steps[active_step_index]
+                    if active_step.get("status") == "running":
+                        active_step["status"] = "failed"
+                        active_step["error"] = str(exc)
+                _skip_engagement_tail(
+                    steps,
+                    after_index=active_step_index,
+                    reason="Skipped after an earlier phase failed",
+                )
         log_event(f"Playbook error {engagement_id}: {exc}", engagement_id=engagement_id)
 
 
@@ -1744,7 +2060,10 @@ async def playbook_run():
     target = target.strip()
     # Validate target using the same payload rules as a Ping scan.
     probe = {"target": target, "scan_type": "Ping"}
-    _t, _st, _i, _p, _s, _d, error = _validate_scan_payload(probe)
+    _t, _st, _i, _p, _s, _d, error = _validate_scan_payload(
+        probe,
+        validate_interval=False,
+    )
     if error:
         return jsonify({"error": error}), 400
     target = _t or target
@@ -1816,7 +2135,7 @@ async def playbook_status(engagement_id: str):
 
 @app.route("/playbook/<engagement_id>", methods=["DELETE"])
 async def playbook_cancel(engagement_id: str):
-    """Cancel a running playbook (does not kill in-flight Nmap process tree)."""
+    """Cancel a running playbook and its in-flight scan job."""
     auth_error = require_api_auth("scan")
     if auth_error:
         return auth_error
@@ -1830,9 +2149,57 @@ async def playbook_cancel(engagement_id: str):
                 return jsonify({"error": "Engagement not found"}), 404
         eng["status"] = "cancelled"
         task = _engagement_tasks.get(engagement_id)
+        active_steps = []
+        for index, step in enumerate(eng.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            if step.get("status") == "pending":
+                step["status"] = "skipped"
+                step["error"] = "Skipped because the playbook was cancelled"
+                continue
+            if step.get("status") != "running":
+                continue
+            job_id = step.get("job_id")
+            if job_id:
+                active_steps.append((index, str(job_id)))
+            else:
+                step["status"] = "cancelled"
+                step["error"] = "Playbook cancelled"
     if task and not task.done():
         task.cancel()
-    record_audit_event("playbook.cancel", status="cancelled", detail=engagement_id)
+
+    cancelled_job_ids = []
+    killed_processes = 0
+    for index, job_id in active_steps:
+        job, changed, killed = await _cancel_scan_job(job_id, owner_id=owner)
+        if changed:
+            cancelled_job_ids.append(job_id)
+        if killed:
+            killed_processes += 1
+        async with _engagements_lock:
+            current = engagements.get(engagement_id)
+            steps = current.get("steps") if current else None
+            if not isinstance(steps, list) or not 0 <= index < len(steps):
+                continue
+            step = steps[index]
+            if not isinstance(step, dict):
+                continue
+            if job is None:
+                step["status"] = "cancelled"
+                step["error"] = "Playbook cancelled"
+            else:
+                step["status"] = job.get("status") or "cancelled"
+                step["result_file"] = job.get("result_file")
+                step["error"] = job.get("error")
+
+    record_audit_event(
+        "playbook.cancel",
+        status="cancelled",
+        detail=(
+            f"{engagement_id};jobs={','.join(cancelled_job_ids)};"
+            f"processes_killed={killed_processes}"
+        ),
+    )
     return jsonify(public_engagement_view(eng)), 200
 
 
@@ -1852,9 +2219,14 @@ async def posture_evaluate():
     if error:
         return jsonify({"error": error}), 400 if "not found" not in error.lower() else 404
     try:
-        expected = body.get("posture") or body.get("expected")
-        if expected is None:
+        if "posture" in body:
+            expected = body["posture"]
+        elif "expected" in body:
+            expected = body["expected"]
+        else:
             expected = load_expected_posture()
+        if expected is None:
+            pass
         elif isinstance(expected, str):
             expected = load_expected_posture(expected)
         elif not isinstance(expected, dict):
@@ -1862,7 +2234,11 @@ async def posture_evaluate():
         else:
             # Normalize list form under services if caller posted raw list.
             if "services" not in expected and isinstance(expected.get("ports"), list):
-                expected = {"services": expected["ports"], "deny_unexpected": True}
+                expected = {
+                    "services": expected["ports"],
+                    "deny_unexpected": expected.get("deny_unexpected", True),
+                }
+            expected = load_expected_posture(json.dumps(expected))
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
     report = evaluate_posture(scan, expected)
@@ -1883,7 +2259,10 @@ async def start_scan():
         data, preset_error = apply_preset_to_payload(data if isinstance(data, dict) else None)
         if preset_error:
             return jsonify({"error": preset_error}), 400
-        target, scan_type, _, ports, scripts, discovery, error = _validate_scan_payload(data)
+        target, scan_type, _, ports, scripts, discovery, error = _validate_scan_payload(
+            data,
+            validate_interval=False,
+        )
         if error:
             return jsonify({"error": error}), 400
 
@@ -1904,6 +2283,8 @@ async def start_scan():
                     discovery=discovery,
                     owner_id=current_owner_id(),
                 )
+            except JobCancelledError as e:
+                return jsonify({"error": str(e), "status": "cancelled"}), 409
             except TimeoutError as e:
                 return jsonify({"error": str(e)}), 504
             except Exception as e:
@@ -1954,15 +2335,29 @@ async def list_jobs():
         return auth_error
 
     owner = current_owner_id()
+    try:
+        persisted = await asyncio.to_thread(state_store.list_jobs, MAX_SCAN_JOBS, owner)
+    except Exception as exc:
+        log_event(f"Failed to list persisted jobs: {exc}")
+        persisted = []
     async with _jobs_lock:
+        merged = {
+            job["job_id"]: job
+            for job in persisted
+            if job.get("job_id") and job_visible_to_owner(job, owner)
+        }
+        for job in scan_jobs.values():
+            if job_visible_to_owner(job, owner) and job["job_id"] not in merged:
+                # Durable state wins. Memory-only rows are retained only for
+                # compatibility with tests/startup edge cases.
+                merged[job["job_id"]] = job
         jobs = [
             _job_public_view(job, include_result=False)
             for job in sorted(
-                scan_jobs.values(),
+                merged.values(),
                 key=lambda item: item.get("created_at") or "",
                 reverse=True,
-            )
-            if job_visible_to_owner(job, owner)
+            )[:MAX_SCAN_JOBS]
         ]
     return jsonify(jobs), 200
 
@@ -1973,15 +2368,89 @@ async def get_job(job_id: str):
     if auth_error:
         return auth_error
 
-    async with _jobs_lock:
-        job = scan_jobs.get(job_id)
+    job = await _refresh_job_from_store(job_id)
     if not job:
-        job = await asyncio.to_thread(state_store.get_job, job_id)
-        if not job:
-            return jsonify({"error": "Job not found"}), 404
+        return jsonify({"error": "Job not found"}), 404
     if not job_visible_to_owner(job):
         return jsonify({"error": "Job not found"}), 404
+    if job.get("status") == "completed" and not isinstance(job.get("result"), dict):
+        loaded = await _load_job_result_payload(job)
+        if loaded is not None:
+            job = {**job, "result": loaded}
     return jsonify(_job_public_view(job, include_result=True)), 200
+
+
+async def _cancel_scan_job(
+    job_id: str,
+    *,
+    owner_id: str,
+) -> Tuple[Optional[Dict[str, Any]], bool, bool]:
+    """Cancel an owned queued/running job and return (job, changed, process_killed)."""
+    finished_at = _utc_now_iso()
+    durable, changed = await asyncio.to_thread(
+        state_store.cancel_job_if_active,
+        job_id,
+        owner_id,
+        finished_at=finished_at,
+        error="Scan cancelled",
+    )
+    if durable is None:
+        # Compatibility for process-local jobs created by older integrations.
+        # New jobs are inserted durably before they can be launched.
+        async with _jobs_lock:
+            existing = scan_jobs.get(job_id)
+            if existing is None or not job_visible_to_owner(existing, owner_id):
+                return None, False, False
+            previous_status = existing.get("status")
+            changed = previous_status in {"queued", "running"}
+            if changed:
+                existing.update(
+                    {
+                        "status": "cancelled",
+                        "finished_at": finished_at,
+                        "error": "Scan cancelled",
+                        "lease_owner": None,
+                        "lease_until": None,
+                    }
+                )
+                _note_job_terminal_metrics(
+                    existing,
+                    previous_status=previous_status,
+                    status="cancelled",
+                )
+            job = existing
+            task = existing.get("task")
+            should_stop = changed or existing.get("status") == "cancelled"
+            if should_stop and task is not None and not task.done():
+                task.cancel()
+        killed = _request_job_process_cancel(job_id) if should_stop else False
+        return job, changed, killed
+
+    async with _jobs_lock:
+        existing = scan_jobs.get(job_id)
+        task = (existing or {}).get("task")
+        previous_status = (existing or {}).get("status")
+        result = None
+        if (
+            existing
+            and durable.get("status") == "completed"
+            and existing.get("status") == "completed"
+            and existing.get("result_file") == durable.get("result_file")
+        ):
+            result = existing.get("result")
+        job = {**durable, "task": task, "result": result}
+        scan_jobs[job_id] = job
+        if changed:
+            _note_job_terminal_metrics(job, previous_status=previous_status, status="cancelled")
+        should_stop = changed or durable.get("status") == "cancelled"
+        if should_stop and task is not None and not task.done():
+            task.cancel()
+
+    # Hard-cancel Nmap/discovery process group (task.cancel alone does not stop executor).
+    killed = _request_job_process_cancel(job_id) if should_stop else False
+    if changed:
+        _release_redis_job_lease(job_id)
+    return job, changed, killed
 
 
 @app.route("/jobs/<job_id>", methods=["DELETE"])
@@ -1990,30 +2459,17 @@ async def cancel_job(job_id: str):
     if auth_error:
         return auth_error
 
-    async with _jobs_lock:
-        job = scan_jobs.get(job_id)
-        if job is None:
-            job = await asyncio.to_thread(state_store.get_job, job_id)
-            if job is not None:
-                scan_jobs[job_id] = job
-        if not job or not job_visible_to_owner(job):
-            return jsonify({"error": "Job not found"}), 404
-        if job["status"] in _TERMINAL_JOB_STATUSES:
-            return jsonify({"message": f"Job already {job['status']}", "job_id": job_id}), 200
-        task = job.get("task")
-        previous_status = job.get("status")
-        job["status"] = "cancelled"
-        job["finished_at"] = _utc_now_iso()
-        job["error"] = "Scan cancelled"
-        job["lease_owner"] = None
-        job["lease_until"] = None
-        _note_job_terminal_metrics(job, previous_status=previous_status, status="cancelled")
-        if task is not None and not task.done():
-            task.cancel()
-        _persist_job(job)
-    # Hard-cancel Nmap/discovery process group (task.cancel alone does not stop executor).
-    killed = kill_active_process(job_id)
-    _release_redis_job_lease(job_id)
+    job, changed, killed = await _cancel_scan_job(job_id, owner_id=current_owner_id())
+    if job is None:
+        return jsonify({"error": "Job not found"}), 404
+    if not changed:
+        return jsonify(
+            {
+                "message": f"Job already {job['status']}",
+                "job_id": job_id,
+                "process_killed": killed,
+            }
+        ), 200
     log_event(
         f"Job {job_id} cancelled",
         job_id=job_id,
@@ -2210,7 +2666,10 @@ async def periodic_scan(
                 scripts=scripts,
                 discovery=discovery,
                 owner_id=owner,
+                kind="scheduled",
             )
+        except JobCancelledError:
+            log_event(f"Periodic scan occurrence cancelled: {target}")
         except asyncio.CancelledError:
             log_event(f"Periodic scan {target} cancelled")
             break
@@ -2236,6 +2695,9 @@ async def add_scheduled_scan():
             return jsonify({"error": "Rate limit exceeded"}), 429
 
         data = await request.get_json(silent=True)
+        data, preset_error = apply_preset_to_payload(data if isinstance(data, dict) else None)
+        if preset_error:
+            return jsonify({"error": preset_error}), 400
         target, scan_type, interval, ports, scripts, discovery, error = _validate_scan_payload(data)
         if error:
             return jsonify({"error": error}), 400
@@ -2317,7 +2779,7 @@ async def list_tasks():
         return auth_error
 
     owner = current_owner_id()
-    owner_prefix = f"o{owner[:12]}-"
+    owner_prefix = f"o{owner_result_prefix(owner)[1:13]}-"
     _cleanup_finished_tasks()
     try:
         rows = await asyncio.to_thread(state_store.list_scheduled_tasks)
@@ -2369,24 +2831,32 @@ async def cancel_task(task_id):
         return auth_error
 
     owner = current_owner_id()
-    owner_prefix = f"o{owner[:12]}-"
+    owner_prefix = f"o{owner_result_prefix(owner)[1:13]}-"
     if task_id.startswith("o") and not task_id.startswith(owner_prefix):
         return jsonify({"error": "Task not found"}), 404
 
     _cleanup_finished_tasks()
-    deleted = False
-    if task_id in scan_tasks:
-        scan_tasks[task_id].cancel()
-        del scan_tasks[task_id]
-        deleted = True
+    local_exists = task_id in scan_tasks
+    durable_exists = False
     try:
-        # Durable delete so the leader stops after sync even if this worker is not leader.
+        # Delete durable state first so a successful response cannot be
+        # reversed by leader synchronization.
         existing = await asyncio.to_thread(state_store.list_scheduled_tasks)
-        if any(row.get("task_id") == task_id for row in existing):
-            state_store.delete_scheduled_task(task_id)
-            deleted = True
+        durable_exists = any(row.get("task_id") == task_id for row in existing)
+        if durable_exists:
+            deleted_durable = await asyncio.to_thread(
+                state_store.delete_scheduled_task,
+                task_id,
+            )
+            if not deleted_durable:
+                return jsonify({"error": "Failed to delete persisted task"}), 503
     except Exception as exc:
         log_event(f"Failed to delete persisted task {task_id}: {exc}")
+        return jsonify({"error": "Failed to delete persisted task"}), 503
+    if local_exists:
+        scan_tasks[task_id].cancel()
+        del scan_tasks[task_id]
+    deleted = durable_exists or local_exists
     if deleted:
         log_event(f"Task {task_id} cancelled")
         record_audit_event("schedule.cancel", task_id=task_id, status="cancelled")
@@ -2685,10 +3155,7 @@ async def _resolve_scan_for_pack(
         return body, None, None, None
 
     if job_id:
-        async with _jobs_lock:
-            job = scan_jobs.get(job_id)
-        if job is None:
-            job = await asyncio.to_thread(state_store.get_job, job_id)
+        job = await _refresh_job_from_store(job_id)
         if not job or not job_visible_to_owner(job):
             return None, "Job not found", None, job_id
         if job.get("status") != "completed":
@@ -2898,6 +3365,14 @@ async def add_security_headers(response):
             response.headers["Content-Security-Policy"] = (
                 "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
             )
+    rule = getattr(request, "url_rule", None)
+    route = getattr(rule, "rule", None) or "unmatched"
+    METRICS.inc(
+        "recon_operator_http_requests_total",
+        method=request.method,
+        route=route,
+        status=str(response.status_code),
+    )
     return response
 
 
@@ -2918,11 +3393,18 @@ def _check_nmap_available() -> bool:
 
 
 def _job_status_gauges() -> Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float]:
-    """Live gauges derived from in-memory job/task tables (for /metrics scrape)."""
+    """Live gauges derived from durable state shared by every worker."""
+    try:
+        jobs = state_store.list_jobs(MAX_SCAN_JOBS)
+        scheduled_count = len(state_store.list_scheduled_tasks())
+    except Exception as exc:
+        log_event(f"Metrics durable-state read failed: {exc}")
+        jobs = list(scan_jobs.values())
+        scheduled_count = len(scan_tasks)
     queued = 0
     running = 0
     known = 0
-    for job in scan_jobs.values():
+    for job in jobs:
         known += 1
         status = job.get("status")
         if status == "queued":
@@ -2933,7 +3415,7 @@ def _job_status_gauges() -> Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float]
         ("recon_operator_jobs_queued", ()): float(queued),
         ("recon_operator_jobs_running", ()): float(running),
         ("recon_operator_jobs_known", ()): float(known),
-        ("recon_operator_scheduled_tasks", ()): float(len(scan_tasks)),
+        ("recon_operator_scheduled_tasks", ()): float(scheduled_count),
     }
 
 
@@ -2978,6 +3460,8 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "results_max_files": RESULTS_MAX_FILES,
         "results_max_age_days": RESULTS_MAX_AGE_DAYS,
         "legacy_results_shared": LEGACY_RESULTS_SHARED,
+        "api_auth_required": API_AUTH_REQUIRED,
+        "api_auth_header": API_AUTH_HEADER,
         "api_key_count": len([key for key in API_AUTH_KEYS if not key.get("revoked")]),
         "named_api_keys": len(API_AUTH_KEYS) > 0,
         "worker_id": WORKER_ID,
@@ -3196,7 +3680,11 @@ def build_openapi_spec() -> dict:
             "/metrics": {
                 "get": {
                     "summary": "Prometheus metrics scrape",
-                    "security": [],
+                    "security": (
+                        [{"ApiKeyAuth": []}]
+                        if METRICS_AUTH_REQUIRED and API_AUTH_REQUIRED
+                        else []
+                    ),
                     "responses": {
                         "200": {"description": "Prometheus text exposition (jobs, scans, rates)"}
                     },
@@ -3625,7 +4113,11 @@ async def api_docs():
                 "GET /health": {"description": "Detailed health snapshot"},
                 "GET /metrics": {
                     "description": "Prometheus text metrics (jobs queued/running, finish totals, durations)",
-                    "auth": "none (scrape; bind loopback or firewall in production)",
+                    "auth": (
+                        "read scope"
+                        if METRICS_AUTH_REQUIRED and API_AUTH_REQUIRED
+                        else "none (scrape; bind loopback or firewall in production)"
+                    ),
                 },
                 "GET /openapi.json": {"description": "OpenAPI 3 schema"},
                 "GET /tools": {
@@ -3694,8 +4186,14 @@ async def load_initial_tasks():
                 log_event("INITIAL_TASKS contains an invalid element")
                 continue
 
+            merged_config, preset_error = apply_preset_to_payload(task_config)
+            if preset_error or merged_config is None:
+                log_event(
+                    f"INITIAL_TASKS: skipped task ({preset_error}). Payload: {task_config}"
+                )
+                continue
             target, scan_type, interval, ports, scripts, discovery, error = _validate_scan_payload(
-                task_config
+                merged_config
             )
             if error:
                 log_event(f"INITIAL_TASKS: skipped task ({error}). Payload: {task_config}")
@@ -3705,6 +4203,30 @@ async def load_initial_tasks():
                 interval = 30.0
 
             owner = "local"
+            if API_AUTH_REQUIRED:
+                eligible_keys = [
+                    key
+                    for key in API_AUTH_KEYS
+                    if not key.get("revoked")
+                    and scopes_allow(key.get("effective_scopes") or key.get("scopes"), {"scan"})
+                ]
+                requested_key_id = str(task_config.get("owner_key_id") or "").strip()
+                if requested_key_id:
+                    key = next(
+                        (row for row in eligible_keys if row.get("id") == requested_key_id),
+                        None,
+                    )
+                elif len(eligible_keys) == 1:
+                    key = eligible_keys[0]
+                else:
+                    key = None
+                if key is None:
+                    log_event(
+                        "INITIAL_TASKS: skipped task because owner_key_id is missing, "
+                        "unknown, revoked, or lacks scan scope"
+                    )
+                    continue
+                owner = owner_id_from_token(str(key["token"]))
             task_id = make_task_id(target, scan_type, owner)
             if task_id in existing:
                 continue
@@ -3744,29 +4266,11 @@ async def load_persisted_state():
         log_event(f"Failed to load persisted jobs: {exc}")
         jobs = []
 
-    now = time.time()
     async with _jobs_lock:
         for job in jobs:
-            status = job.get("status")
-            lease_until = job.get("lease_until")
-            lease_owner = job.get("lease_owner")
-            # Requeue work that this process can reclaim; leave active foreign leases alone.
-            if status == "queued":
-                job["lease_owner"] = None
-                job["lease_until"] = None
-            elif status == "running":
-                expired = lease_until is None or float(lease_until) < now
-                ours = lease_owner in (None, WORKER_ID)
-                if expired or ours:
-                    job["status"] = "queued"
-                    job["lease_owner"] = None
-                    job["lease_until"] = None
-                    job["started_at"] = None
-                    job["error"] = None
-                    try:
-                        state_store.upsert_job(job)
-                    except Exception as exc:
-                        log_event(f"Failed to requeue interrupted job {job.get('job_id')}: {exc}")
+            # Do not rewrite a startup snapshot: another worker may have
+            # acquired or renewed the lease after list_jobs returned. The
+            # atomic claim loop reclaims expired queued/running work.
             scan_jobs[job["job_id"]] = job
         log_event(f"Loaded {len(scan_jobs)} persisted scan jobs from {STATE_DB_PATH}")
 
@@ -3878,5 +4382,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log_event("KeyboardInterrupt received")
+        raise SystemExit(130)
     except Exception as e:
         log_event(f"Critical error: {e}")
+        raise SystemExit(1)

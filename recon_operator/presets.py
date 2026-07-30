@@ -101,7 +101,8 @@ def apply_preset_to_payload(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Merge preset fields into a scan payload.
 
-    Explicit payload keys win over preset defaults (operator override).
+    Explicit payload keys may refine a preset, but cannot replace its scan
+    profile while retaining dependent preset defaults.
     Returns (merged_payload, error).
     """
     if not isinstance(payload, dict):
@@ -114,6 +115,18 @@ def apply_preset_to_payload(
     if preset is None:
         known = ", ".join(sorted(PRESETS.keys()))
         return None, f"Unknown preset {raw!r}. Known: {known}"
+
+    explicit_scan_type = data.get("scan_type")
+    if (
+        explicit_scan_type not in (None, "")
+        and str(explicit_scan_type).strip().lower()
+        != str(preset["scan_type"]).strip().lower()
+    ):
+        return (
+            None,
+            f"Preset {preset['id']!r} requires scan_type={preset['scan_type']}; "
+            "remove preset to use a different scan_type",
+        )
 
     # Fill only when caller did not set the field (None/missing).
     if data.get("scan_type") in (None, ""):

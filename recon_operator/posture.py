@@ -6,10 +6,25 @@ scan result to produce machine-readable drift rows for AI packs and retests.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+def _normalize_host(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return text.rstrip(".").lower()
+
+
+def _service_name_matches(expected: str, observed: str) -> bool:
+    return expected in {"unknown", "*"} or observed == "unknown" or expected == observed
 
 
 def _open_service_keys(scan: Dict[str, Any]) -> Set[Tuple[str, str, int, str]]:
@@ -21,7 +36,7 @@ def _open_service_keys(scan: Dict[str, Any]) -> Set[Tuple[str, str, int, str]]:
     for host_row in hosts:
         if not isinstance(host_row, dict):
             continue
-        host = str(host_row.get("host") or "").strip()
+        host = _normalize_host(host_row.get("host"))
         if not host:
             continue
         protocols = host_row.get("protocols") or {}
@@ -40,7 +55,7 @@ def _open_service_keys(scan: Dict[str, Any]) -> Set[Tuple[str, str, int, str]]:
                 except (TypeError, ValueError):
                     continue
                 name = str(port_row.get("name") or "unknown").lower()
-                found.add((host, str(protocol or "tcp"), port, name))
+                found.add((host, str(protocol or "tcp").lower(), port, name))
     return found
 
 
@@ -85,26 +100,34 @@ def load_expected_posture(
         services = []
     if not isinstance(services, list):
         raise RuntimeError("EXPECTED_POSTURE.services must be an array")
+    deny_unexpected = parsed.get("deny_unexpected", True)
+    if not isinstance(deny_unexpected, bool):
+        raise RuntimeError("EXPECTED_POSTURE.deny_unexpected must be boolean")
     normalized: List[Dict[str, Any]] = []
     for index, item in enumerate(services):
         if not isinstance(item, dict):
             raise RuntimeError(f"EXPECTED_POSTURE.services[{index}] must be an object")
+        raw_port = item.get("port")
+        if isinstance(raw_port, bool):
+            raise RuntimeError(f"EXPECTED_POSTURE.services[{index}].port must be int")
+        if isinstance(raw_port, float) and not raw_port.is_integer():
+            raise RuntimeError(f"EXPECTED_POSTURE.services[{index}].port must be int")
         try:
-            port = int(item.get("port"))
+            port = int(raw_port)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"EXPECTED_POSTURE.services[{index}].port must be int") from exc
         if not 1 <= port <= 65535:
             raise RuntimeError(f"EXPECTED_POSTURE.services[{index}].port out of range")
         normalized.append(
             {
-                "host": (str(item["host"]).strip() if item.get("host") else None),
+                "host": _normalize_host(item.get("host")),
                 "proto": str(item.get("proto") or item.get("protocol") or "tcp").lower(),
                 "port": port,
                 "name": str(item.get("name") or item.get("service") or "unknown").lower(),
             }
         )
     return {
-        "deny_unexpected": bool(parsed.get("deny_unexpected", True)),
+        "deny_unexpected": deny_unexpected,
         "services": normalized,
     }
 
@@ -151,12 +174,10 @@ def evaluate_posture(
         for host, p_proto, p_port, p_name in open_keys:
             if p_port != port or p_proto != proto:
                 continue
-            if host_rule and host != host_rule:
+            if host_rule and host != _normalize_host(host_rule):
                 continue
-            # name match is soft: unknown expected name still matches port/proto
-            if name not in {"unknown", "*"} and p_name not in {name, "unknown"}:
-                # allow product mismatch only if names differ strongly — still count port match
-                pass
+            if not _service_name_matches(name, p_name):
+                continue
             matched = True
             break
         if not matched:
@@ -176,21 +197,22 @@ def evaluate_posture(
 
     # Unexpected open services.
     if deny_unexpected:
-        expected_ports: Set[Tuple[Optional[str], str, int]] = set()
+        expected_ports: Set[Tuple[Optional[str], str, int, str]] = set()
         for rule in expected_services:
             if not isinstance(rule, dict):
                 continue
             expected_ports.add(
                 (
-                    rule.get("host"),
-                    str(rule.get("proto") or "tcp"),
+                    _normalize_host(rule.get("host")),
+                    str(rule.get("proto") or "tcp").lower(),
                     int(rule["port"]),
+                    str(rule.get("name") or "unknown").lower(),
                 )
             )
         for host, proto, port, name in sorted(open_keys):
             allowed = False
-            for host_rule, e_proto, e_port in expected_ports:
-                if e_proto == proto and e_port == port:
+            for host_rule, e_proto, e_port, e_name in expected_ports:
+                if e_proto == proto and e_port == port and _service_name_matches(e_name, name):
                     if host_rule is None or host_rule == host:
                         allowed = True
                         break
@@ -208,9 +230,9 @@ def evaluate_posture(
                     }
                 )
 
+    unexpected = sum(1 for drift in drifts if drift.get("op") == "unexpected")
+    missing = sum(1 for drift in drifts if drift.get("op") == "missing")
     drifts = drifts[: max(0, int(max_rows))]
-    unexpected = sum(1 for d in drifts if d.get("op") == "unexpected")
-    missing = sum(1 for d in drifts if d.get("op") == "missing")
     return {
         "enabled": True,
         "deny_unexpected": deny_unexpected,

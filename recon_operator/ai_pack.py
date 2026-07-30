@@ -121,7 +121,11 @@ def normalize_budget(raw: Any) -> str:
     raise ValueError("budget must be one of: s, m, l (or small/medium/large)")
 
 
-def _iter_open_services(scan: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+def _iter_services(
+    scan: Dict[str, Any],
+    *,
+    states: Set[str],
+) -> Iterable[Dict[str, Any]]:
     hosts = scan.get("hosts") if isinstance(scan, dict) else None
     if not isinstance(hosts, list):
         return
@@ -134,7 +138,7 @@ def _iter_open_services(scan: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
         hostname = host_row.get("hostname")
         if hostname in (None, "", "N/A"):
             hostname = None
-        state = str(host_row.get("state") or "unknown")
+        host_state = str(host_row.get("state") or "unknown")
         protocols = host_row.get("protocols") or {}
         if not isinstance(protocols, dict):
             continue
@@ -144,7 +148,8 @@ def _iter_open_services(scan: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
             for port_row in ports:
                 if not isinstance(port_row, dict):
                     continue
-                if str(port_row.get("state") or "").lower() != "open":
+                port_state = str(port_row.get("state") or "unknown").lower()
+                if port_state not in states:
                     continue
                 try:
                     port = int(port_row.get("port"))
@@ -155,13 +160,18 @@ def _iter_open_services(scan: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
                 yield {
                     "host": host,
                     "hostname": hostname,
-                    "host_state": state,
+                    "host_state": host_state,
                     "protocol": str(protocol or "tcp"),
                     "port": port,
+                    "state": port_state,
                     "name": str(port_row.get("name") or "unknown").lower(),
                     "product": port_row.get("product"),
                     "version": port_row.get("version"),
                 }
+
+
+def _iter_open_services(scan: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    yield from _iter_services(scan, states={"open"})
 
 
 def _finding_for_service(svc: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -238,28 +248,53 @@ def build_ai_pack_rows(
         except RuntimeError:
             expected_posture = None
 
-    services = list(_iter_open_services(scan))
-    # Optionally surface closed ports only when explicitly requested (not default).
-    if include_closed and budget_key == "l":
-        # Intentionally limited: still not dumping full closed noise into s/m.
-        pass
-
-    hosts_seen: List[str] = []
+    include_closed_effective = bool(include_closed and budget_key == "l")
+    hosts_seen_all: List[str] = []
     host_meta: Dict[str, Dict[str, Any]] = {}
-    for svc in services:
-        host = svc["host"]
+    scan_hosts = scan.get("hosts")
+    for host_row in scan_hosts if isinstance(scan_hosts, list) else []:
+        if not isinstance(host_row, dict):
+            continue
+        host = str(host_row.get("host") or "").strip()
+        if not host:
+            continue
         if host not in host_meta:
-            hosts_seen.append(host)
+            hosts_seen_all.append(host)
+            hostname = host_row.get("hostname")
             host_meta[host] = {
                 "t": "host",
                 "ip": host,
-                "hostname": svc.get("hostname"),
-                "status": svc.get("host_state") or "unknown",
+                "hostname": hostname if hostname not in (None, "", "N/A") else None,
+                "status": str(host_row.get("state") or "unknown"),
             }
 
-    hosts_seen = hosts_seen[: int(limits["max_hosts"])]
+    hosts_seen = hosts_seen_all[: int(limits["max_hosts"])]
     allowed_hosts = set(hosts_seen)
-    services = [s for s in services if s["host"] in allowed_hosts][: int(limits["max_services"])]
+    max_services = int(limits["max_services"])
+    all_open_services = list(_iter_open_services(scan))
+    eligible_open_services = [
+        service for service in all_open_services if service["host"] in allowed_hosts
+    ]
+    open_services = eligible_open_services[:max_services]
+    all_closed_services: List[Dict[str, Any]] = []
+    eligible_closed_services: List[Dict[str, Any]] = []
+    if include_closed_effective:
+        all_closed_services = list(_iter_services(scan, states={"closed"}))
+        eligible_closed_services = [
+            service for service in all_closed_services if service["host"] in allowed_hosts
+        ]
+    closed_services = eligible_closed_services[
+        : max(0, max_services - len(open_services))
+    ]
+    services = open_services + closed_services
+    source_truncated = (
+        len(hosts_seen) < len(hosts_seen_all)
+        or len(open_services) < len(all_open_services)
+        or (
+            include_closed_effective
+            and len(closed_services) < len(all_closed_services)
+        )
+    )
 
     rows: List[Dict[str, Any]] = []
     meta = {
@@ -268,9 +303,15 @@ def build_ai_pack_rows(
         "budget": budget_key,
         "target": scan.get("target"),
         "scan_type": scan.get("scan_type"),
-        "open_services": len(services),
+        "open_services": len(open_services),
+        "closed_services": len(closed_services),
         "hosts": len(hosts_seen),
-        "include_closed": False,
+        "open_services_total": len(all_open_services),
+        "closed_services_total": len(all_closed_services),
+        "hosts_total": len(hosts_seen_all),
+        "source_truncated": source_truncated,
+        "truncated": source_truncated,
+        "include_closed": include_closed_effective,
         "guardrail": "authorized-enumeration-only; no auto-exploit",
         "usage": "Prefer this pack over full result JSON in LLM context",
     }
@@ -293,6 +334,7 @@ def build_ai_pack_rows(
             "port": svc["port"],
             "proto": svc["protocol"],
             "name": svc["name"],
+            "state": svc["state"],
         }
         if svc.get("hostname"):
             svc_row["hostname"] = svc["hostname"]
@@ -305,7 +347,7 @@ def build_ai_pack_rows(
         rows.append(svc_row)
 
     findings = []
-    for index, svc in enumerate(services, start=1):
+    for index, svc in enumerate(open_services, start=1):
         if len(findings) >= int(limits["max_findings"]):
             break
         findings.append(_finding_for_service(svc, index))
@@ -314,7 +356,7 @@ def build_ai_pack_rows(
     defense_rows: List[Dict[str, Any]] = []
     if limits["include_defense"]:
         seen_defense: Set[str] = set()
-        for svc in services:
+        for svc in open_services:
             if len(defense_rows) >= int(limits["max_defense"]):
                 break
             defense = _defense_for_service(svc)
@@ -402,21 +444,21 @@ def build_ai_pack_rows(
 
     # Clarifying questions (cheap, capped).
     ask_rows: List[Dict[str, Any]] = []
-    if services:
+    if open_services:
         ask_rows.append(
             {
                 "t": "ask",
                 "q": "Which of these open services are intentionally exposed on this engagement scope?",
             }
         )
-    if any(s["name"] in {"http", "https"} for s in services):
+    if any(service["name"] in {"http", "https"} for service in open_services):
         ask_rows.append(
             {
                 "t": "ask",
                 "q": "Is web content scanning authorized beyond passive header/fingerprint checks?",
             }
         )
-    if any(s["name"] == "ssh" for s in services):
+    if any(service["name"] == "ssh" for service in open_services):
         ask_rows.append(
             {
                 "t": "ask",
@@ -449,7 +491,9 @@ def _enforce_hard_caps(
         size += line_size
     if kept and kept[0].get("t") == "meta":
         kept[0] = dict(kept[0])
-        kept[0]["truncated"] = len(kept) < len(rows)
+        kept[0]["truncated"] = bool(
+            kept[0].get("truncated") or len(kept) < len(rows)
+        )
     return kept
 
 
@@ -470,7 +514,9 @@ def _stamp_budget_s_meta(
         }
     )
     meta.pop("bytes", None)
-    meta["truncated"] = bool(truncated or len(rows) < original_len)
+    meta["truncated"] = bool(
+        meta.get("truncated") or truncated or len(rows) < original_len
+    )
     meta["lines"] = 1 + len(rest)
     provisional = [meta] + rest
     # Iterate a few times so the decimal width of ``bytes`` stabilizes.
@@ -535,7 +581,100 @@ def pack_to_ndjson(rows: Sequence[Dict[str, Any]]) -> str:
 
 
 def pack_to_json(rows: Sequence[Dict[str, Any]]) -> str:
-    return json.dumps({"schema": SCHEMA_VERSION, "rows": list(rows)}, ensure_ascii=False)
+    return json.dumps(
+        {"schema": SCHEMA_VERSION, "rows": list(rows)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _serialized_pack_bytes(rows: Sequence[Dict[str, Any]], fmt: str) -> int:
+    if fmt == "json":
+        body = pack_to_json(rows)
+    else:
+        body = pack_to_ndjson(rows)
+    return len(body.encode("utf-8"))
+
+
+def _stamp_serialized_meta(
+    rows: List[Dict[str, Any]],
+    *,
+    fmt: str,
+    truncated: bool,
+    original_len: int,
+) -> List[Dict[str, Any]]:
+    """Stamp metadata for the actual response serialization, including wrapper bytes."""
+    if not rows:
+        return rows
+    rest = list(rows[1:]) if rows[0].get("t") == "meta" else list(rows)
+    meta = (
+        dict(rows[0])
+        if rows[0].get("t") == "meta"
+        else {"t": "meta", "schema": SCHEMA_VERSION, "budget": "s"}
+    )
+    meta.pop("bytes", None)
+    meta["truncated"] = bool(
+        meta.get("truncated") or truncated or len(rows) < original_len
+    )
+    meta["lines"] = 1 + len(rest)
+    stamped = [meta] + rest
+    for _ in range(6):
+        next_meta = dict(stamped[0])
+        next_meta["bytes"] = _serialized_pack_bytes(stamped, fmt)
+        stamped[0] = next_meta
+    return stamped
+
+
+def _fit_budget_s_serialization(
+    rows: List[Dict[str, Any]], *, fmt: str
+) -> List[Dict[str, Any]]:
+    """Make the final JSON or JSONL representation honor the advertised hard cap."""
+    if not rows:
+        return rows
+    original_len = len(rows)
+    kept = list(rows[:BUDGET_S_MAX_LINES])
+    truncated = len(kept) < original_len
+    while kept:
+        stamped = _stamp_serialized_meta(
+            kept,
+            fmt=fmt,
+            truncated=truncated,
+            original_len=original_len,
+        )
+        if _serialized_pack_bytes(stamped, fmt) <= BUDGET_S_MAX_BYTES:
+            return stamped
+        if len(kept) > 1:
+            truncated = True
+            kept.pop()
+            continue
+        meta = dict(stamped[0])
+        for key in (
+            "usage",
+            "guardrail",
+            "open_services",
+            "closed_services",
+            "hosts",
+            "include_closed",
+        ):
+            meta.pop(key, None)
+        meta["truncated"] = True
+        slim = _stamp_serialized_meta(
+            [meta],
+            fmt=fmt,
+            truncated=True,
+            original_len=original_len,
+        )
+        if _serialized_pack_bytes(slim, fmt) <= BUDGET_S_MAX_BYTES:
+            return slim
+        return [
+            {
+                "t": "meta",
+                "schema": SCHEMA_VERSION,
+                "budget": "s",
+                "truncated": True,
+            }
+        ]
+    return kept
 
 
 def _inventory_delta_rows(
@@ -711,7 +850,10 @@ def build_ai_pack(
             expected_posture=expected_posture,
         )
     fmt = str(format or "jsonl").strip().lower()
-    if fmt in {"json", "application/json"}:
+    fmt_key = "json" if fmt in {"json", "application/json"} else "jsonl"
+    if normalize_budget(budget) == "s":
+        rows = _fit_budget_s_serialization(rows, fmt=fmt_key)
+    if fmt_key == "json":
         return pack_to_json(rows), "application/json; charset=utf-8", rows
     return pack_to_ndjson(rows), "application/x-ndjson; charset=utf-8", rows
 

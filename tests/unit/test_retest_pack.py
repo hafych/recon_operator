@@ -134,7 +134,7 @@ class RetestPackTests(unittest.TestCase):
                     "--baseline",
                     str(base_path),
                 ],
-                cwd=str(Path(__file__).resolve().parent),
+                cwd=str(Path(__file__).resolve().parents[2]),
                 capture_output=True,
                 text=True,
                 check=False,

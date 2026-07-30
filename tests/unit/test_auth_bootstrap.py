@@ -6,6 +6,9 @@ import os
 import subprocess
 import sys
 import unittest
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class AuthBootstrapTests(unittest.TestCase):
@@ -32,7 +35,7 @@ assert autonmap.API_AUTH_TOKENS == ["late-test-token"]
         }
         completed = subprocess.run(
             [sys.executable, "-c", code],
-            cwd=os.path.dirname(__file__),
+            cwd=str(PROJECT_ROOT),
             env=clean_env,
             capture_output=True,
             text=True,
