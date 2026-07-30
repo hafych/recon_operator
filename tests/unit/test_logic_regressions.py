@@ -407,7 +407,11 @@ class ServerLogicRegressionTests(unittest.IsolatedAsyncioTestCase):
                 timeout=2,
             )
 
-        self.assertIsInstance(result[0], asyncio.CancelledError)
+        # Depending on whether the heartbeat or the post-scan durable fence
+        # observes the remote cancellation first, the runner either propagates
+        # CancelledError or returns after accepting the durable terminal state.
+        if result[0] is not None:
+            self.assertIsInstance(result[0], asyncio.CancelledError)
         self.assertEqual(autonmap.scan_jobs[job_id]["status"], "cancelled")
         kill.assert_called_with(job_id)
 

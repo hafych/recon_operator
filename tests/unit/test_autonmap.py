@@ -982,9 +982,9 @@ class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "job_id": "j-adopt",
                     "target": "127.0.0.1",
                     "scan_type": "Ping",
-                    "status": "running",
+                    "status": "queued",
                     "created_at": "t0",
-                    "started_at": "t1",
+                    "started_at": None,
                     "kind": "immediate",
                     "owner_id": "local",
                     "lease_owner": autonmap.WORKER_ID,
@@ -998,18 +998,17 @@ class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "finished_at": None,
                     "task": None,
                 }
+                autonmap.state_store.upsert_job(claimed)
                 await autonmap._adopt_claimed_job(claimed)
-                for _ in range(50):
-                    status = autonmap.scan_jobs["j-adopt"]["status"]
-                    if status in {"completed", "failed", "timeout"}:
-                        break
-                    await asyncio.sleep(0.02)
+                runner = autonmap.scan_jobs["j-adopt"]["task"]
+                await asyncio.wait_for(asyncio.shield(runner), timeout=2)
             finally:
                 autonmap.scan_network = original_scan
                 autonmap.send_telegram_message = original_sender
                 autonmap.RESULTS_DIR = original_results
                 autonmap.state_store.release_job_lease = original_release
                 autonmap._renew_job_lease = original_renew
+                autonmap.state_store.delete_job("j-adopt")
 
         self.assertEqual(autonmap.scan_jobs["j-adopt"]["status"], "completed")
 
@@ -1713,14 +1712,16 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "result_file": None,
                 "kind": "immediate",
                 "owner_id": "local",
+                "lease_owner": autonmap.WORKER_ID,
+                "lease_until": time.time() + 60,
                 "task": None,
             }
+            autonmap.state_store.upsert_job(autonmap.scan_jobs["fail-job"])
 
             def boom(*_a, **_k):
                 raise RuntimeError("engine failed")
 
             autonmap.scan_network = boom
-            # already_claimed bypasses SQLite claim (unit path without prior persist).
             await autonmap._run_scan_job("fail-job", already_claimed=True)
             self.assertEqual(autonmap.scan_jobs["fail-job"]["status"], "failed")
             self.assertIn("engine failed", autonmap.scan_jobs["fail-job"]["error"])
@@ -1738,8 +1739,11 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "result_file": None,
                 "kind": "immediate",
                 "owner_id": "local",
+                "lease_owner": autonmap.WORKER_ID,
+                "lease_until": time.time() + 60,
                 "task": None,
             }
+            autonmap.state_store.upsert_job(autonmap.scan_jobs["timeout-job"])
 
             def timeout(*_a, **_k):
                 raise TimeoutError("took too long")
@@ -1750,6 +1754,8 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
         finally:
             autonmap.scan_network = original_scan
             autonmap.send_telegram_message = original_sender
+            autonmap.state_store.delete_job("fail-job")
+            autonmap.state_store.delete_job("timeout-job")
             autonmap.scan_jobs.clear()
 
     async def test_async_scan_returns_result_and_raises_on_failure(self):

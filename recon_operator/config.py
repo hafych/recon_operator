@@ -36,8 +36,7 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off", "n"}:
         return False
     raise RuntimeError(
-        f"{name} must be an explicit boolean "
-        f"(true/false, yes/no, on/off, 1/0), got: {value!r}"
+        f"{name} must be an explicit boolean (true/false, yes/no, on/off, 1/0), got: {value!r}"
     )
 
 
@@ -109,9 +108,7 @@ def _load_trusted_proxies() -> List[str]:
             if not isinstance(parsed, list):
                 raise RuntimeError("TRUSTED_PROXIES JSON value must be an array of strings")
             if any(not isinstance(item, str) or not item.strip() for item in parsed):
-                raise RuntimeError(
-                    "TRUSTED_PROXIES JSON value must contain non-empty strings only"
-                )
+                raise RuntimeError("TRUSTED_PROXIES JSON value must contain non-empty strings only")
             entries.extend(item.strip() for item in parsed)
         else:
             entries.extend(part.strip() for part in raw.split(",") if part.strip())

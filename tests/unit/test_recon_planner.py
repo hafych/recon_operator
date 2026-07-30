@@ -158,11 +158,7 @@ class ReconPlannerTests(unittest.TestCase):
         self.assertTrue(any(row["tool"] == "dig" and row["protocol"] == "udp" for row in rows))
         self.assertFalse(any(row["tool"] == "dnsrecon" for row in rows))
         self.assertTrue(
-            all(
-                row["status"] == "unknown"
-                for row in rows
-                if row["tool"] not in {"ssh-audit"}
-            )
+            all(row["status"] == "unknown" for row in rows if row["tool"] not in {"ssh-audit"})
         )
 
 

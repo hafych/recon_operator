@@ -49,12 +49,7 @@ def utc_now() -> str:
 
 
 def reject_suspicious_target(target: str) -> None:
-    if (
-        not target
-        or target.startswith("-")
-        or len(target) > 512
-        or not TARGET_RE.match(target)
-    ):
+    if not target or target.startswith("-") or len(target) > 512 or not TARGET_RE.match(target):
         raise SystemExit("Refusing suspicious target syntax. Use a host, IP, CIDR, or Nmap range.")
 
 
@@ -398,10 +393,7 @@ def apply_report_retention(root: Path, *, managed_only: bool = False) -> dict:
             if path.is_dir()
             and (
                 not managed_only
-                or (
-                    report_name.fullmatch(path.name)
-                    and (path / "manifest.json").is_file()
-                )
+                or (report_name.fullmatch(path.name) and (path / "manifest.json").is_file())
             )
         ]
         deleted = 0

@@ -72,9 +72,7 @@ class PostureUnitTests(unittest.TestCase):
                 "hosts": [
                     {
                         "host": "APP.EXAMPLE.TEST.",
-                        "protocols": {
-                            "TCP": [{"port": 22, "state": "OPEN", "name": "http"}]
-                        },
+                        "protocols": {"TCP": [{"port": 22, "state": "OPEN", "name": "http"}]},
                     }
                 ]
             },

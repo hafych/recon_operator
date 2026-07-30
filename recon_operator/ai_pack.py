@@ -283,17 +283,12 @@ def build_ai_pack_rows(
         eligible_closed_services = [
             service for service in all_closed_services if service["host"] in allowed_hosts
         ]
-    closed_services = eligible_closed_services[
-        : max(0, max_services - len(open_services))
-    ]
+    closed_services = eligible_closed_services[: max(0, max_services - len(open_services))]
     services = open_services + closed_services
     source_truncated = (
         len(hosts_seen) < len(hosts_seen_all)
         or len(open_services) < len(all_open_services)
-        or (
-            include_closed_effective
-            and len(closed_services) < len(all_closed_services)
-        )
+        or (include_closed_effective and len(closed_services) < len(all_closed_services))
     )
 
     rows: List[Dict[str, Any]] = []
@@ -491,9 +486,7 @@ def _enforce_hard_caps(
         size += line_size
     if kept and kept[0].get("t") == "meta":
         kept[0] = dict(kept[0])
-        kept[0]["truncated"] = bool(
-            kept[0].get("truncated") or len(kept) < len(rows)
-        )
+        kept[0]["truncated"] = bool(kept[0].get("truncated") or len(kept) < len(rows))
     return kept
 
 
@@ -514,9 +507,7 @@ def _stamp_budget_s_meta(
         }
     )
     meta.pop("bytes", None)
-    meta["truncated"] = bool(
-        meta.get("truncated") or truncated or len(rows) < original_len
-    )
+    meta["truncated"] = bool(meta.get("truncated") or truncated or len(rows) < original_len)
     meta["lines"] = 1 + len(rest)
     provisional = [meta] + rest
     # Iterate a few times so the decimal width of ``bytes`` stabilizes.
@@ -613,9 +604,7 @@ def _stamp_serialized_meta(
         else {"t": "meta", "schema": SCHEMA_VERSION, "budget": "s"}
     )
     meta.pop("bytes", None)
-    meta["truncated"] = bool(
-        meta.get("truncated") or truncated or len(rows) < original_len
-    )
+    meta["truncated"] = bool(meta.get("truncated") or truncated or len(rows) < original_len)
     meta["lines"] = 1 + len(rest)
     stamped = [meta] + rest
     for _ in range(6):
@@ -625,9 +614,7 @@ def _stamp_serialized_meta(
     return stamped
 
 
-def _fit_budget_s_serialization(
-    rows: List[Dict[str, Any]], *, fmt: str
-) -> List[Dict[str, Any]]:
+def _fit_budget_s_serialization(rows: List[Dict[str, Any]], *, fmt: str) -> List[Dict[str, Any]]:
     """Make the final JSON or JSONL representation honor the advertised hard cap."""
     if not rows:
         return rows

@@ -119,8 +119,7 @@ def apply_preset_to_payload(
     explicit_scan_type = data.get("scan_type")
     if (
         explicit_scan_type not in (None, "")
-        and str(explicit_scan_type).strip().lower()
-        != str(preset["scan_type"]).strip().lower()
+        and str(explicit_scan_type).strip().lower() != str(preset["scan_type"]).strip().lower()
     ):
         return (
             None,

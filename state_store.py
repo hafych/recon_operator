@@ -90,9 +90,7 @@ class StateStore:
         self._memory_uri: Optional[str] = None
         self._memory_keeper: Optional[sqlite3.Connection] = None
         if self.path == ":memory:":
-            self._memory_uri = (
-                f"file:recon_operator_{uuid.uuid4().hex}?mode=memory&cache=shared"
-            )
+            self._memory_uri = f"file:recon_operator_{uuid.uuid4().hex}?mode=memory&cache=shared"
             self._memory_keeper = sqlite3.connect(
                 self._memory_uri,
                 uri=True,

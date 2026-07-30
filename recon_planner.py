@@ -177,9 +177,7 @@ def _inventory_status(inventory: Dict) -> Dict[str, bool]:
                 if isinstance(command, dict):
                     command_name = str(command.get("name") or "").strip()
                     if command_name:
-                        status[command_name] = bool(
-                            command.get("present") or command.get("path")
-                        )
+                        status[command_name] = bool(command.get("present") or command.get("path"))
     return status
 
 

@@ -94,6 +94,7 @@ start_time = datetime.now(timezone.utc)
 class JobCancelledError(RuntimeError):
     """A scan job reached the cancelled domain state."""
 
+
 # --- Config surface (source of truth: recon_operator.config) ---
 VERSION = _config.VERSION
 SCAN_LOG_PATH = _config.SCAN_LOG_PATH
@@ -257,6 +258,7 @@ async def _enforce_route_body_limit():
 @app.errorhandler(413)
 async def _request_too_large(_error):
     return jsonify({"error": "Request body too large"}), 413
+
 
 SUPPORTED_SCAN_TYPES = {name: name for name in supported_scan_types()}
 RESULT_FILENAME_RE = re.compile(
@@ -1974,9 +1976,7 @@ async def _run_engagement(engagement_id: str) -> None:
                 step["error"] = finished.get("error")
                 if finished.get("status") != "completed":
                     eng["status"] = (
-                        "cancelled"
-                        if finished.get("status") == "cancelled"
-                        else "failed"
+                        "cancelled" if finished.get("status") == "cancelled" else "failed"
                     )
                     _skip_engagement_tail(
                         steps,
@@ -3681,9 +3681,7 @@ def build_openapi_spec() -> dict:
                 "get": {
                     "summary": "Prometheus metrics scrape",
                     "security": (
-                        [{"ApiKeyAuth": []}]
-                        if METRICS_AUTH_REQUIRED and API_AUTH_REQUIRED
-                        else []
+                        [{"ApiKeyAuth": []}] if METRICS_AUTH_REQUIRED and API_AUTH_REQUIRED else []
                     ),
                     "responses": {
                         "200": {"description": "Prometheus text exposition (jobs, scans, rates)"}
@@ -4188,9 +4186,7 @@ async def load_initial_tasks():
 
             merged_config, preset_error = apply_preset_to_payload(task_config)
             if preset_error or merged_config is None:
-                log_event(
-                    f"INITIAL_TASKS: skipped task ({preset_error}). Payload: {task_config}"
-                )
+                log_event(f"INITIAL_TASKS: skipped task ({preset_error}). Payload: {task_config}")
                 continue
             target, scan_type, interval, ports, scripts, discovery, error = _validate_scan_payload(
                 merged_config

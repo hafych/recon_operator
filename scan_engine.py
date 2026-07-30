@@ -460,9 +460,7 @@ def discover_open_ports(
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()[:2000]
         suffix = f": {detail}" if detail else ""
-        raise DiscoveryError(
-            f"{resolved} exited with status {completed.returncode}{suffix}"
-        )
+        raise DiscoveryError(f"{resolved} exited with status {completed.returncode}{suffix}")
     return {
         "engine": resolved,
         "command": command,
