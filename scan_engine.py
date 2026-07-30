@@ -25,6 +25,7 @@ SCHEMA_VERSION = "recon-operator-result/v1"
 
 # Active child processes keyed by optional token (usually job_id) for hard cancel.
 _ACTIVE_PROCS: Dict[str, subprocess.Popen] = {}
+_PROCESS_CANCEL_EVENTS: Dict[str, threading.Event] = {}
 _PROC_LOCK = threading.Lock()
 
 # API scan type names → Nmap argv fragments (multi-profile, not Nmap-only product).
@@ -52,7 +53,6 @@ HYBRID_NMAP_PROFILE = "Version"
 
 PORTS_RE = re.compile(r"^[0-9A-Za-z:,\-]{1,200}$")
 SCRIPTS_RE = re.compile(r"^[A-Za-z0-9_.,+\-*/]{1,300}$")
-PORT_TOKEN_RE = re.compile(r"\b([1-9]\d{0,4})\b")
 
 
 class NmapNotFoundError(RuntimeError):
@@ -87,6 +87,38 @@ def _register_process(token: Optional[str], proc: subprocess.Popen) -> None:
         _ACTIVE_PROCS[token] = proc
     if previous is not None and previous.poll() is None and previous is not proc:
         _terminate_process(previous)
+
+
+def prepare_process_token(token: str) -> None:
+    """Create cancellation state before executor work can start."""
+    if not token:
+        return
+    with _PROC_LOCK:
+        _PROCESS_CANCEL_EVENTS[token] = threading.Event()
+
+
+def mark_process_cancelled(token: str) -> None:
+    """Record cancellation even if a subprocess has not registered yet."""
+    if not token:
+        return
+    with _PROC_LOCK:
+        event = _PROCESS_CANCEL_EVENTS.setdefault(token, threading.Event())
+        event.set()
+
+
+def process_cancelled(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    with _PROC_LOCK:
+        event = _PROCESS_CANCEL_EVENTS.get(token)
+        return bool(event and event.is_set())
+
+
+def clear_process_token(token: str) -> None:
+    if not token:
+        return
+    with _PROC_LOCK:
+        _PROCESS_CANCEL_EVENTS.pop(token, None)
 
 
 def _unregister_process(token: Optional[str], proc: Optional[subprocess.Popen] = None) -> None:
@@ -166,6 +198,8 @@ def _run_tracked(
             text=True,
             timeout=timeout,
         )
+    if process_cancelled(process_token):
+        raise ScanCancelledError("Scan cancelled before process start")
     try:
         proc = subprocess.Popen(
             list(command),
@@ -177,6 +211,13 @@ def _run_tracked(
     except FileNotFoundError:
         raise
     _register_process(process_token, proc)
+    if process_cancelled(process_token):
+        _terminate_process(proc)
+        _unregister_process(process_token, proc)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+        raise ScanCancelledError("Scan cancelled during process start")
     try:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -184,12 +225,15 @@ def _run_tracked(
             _terminate_process(proc)
             _unregister_process(process_token, proc)
             raise
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             args=list(command),
             returncode=proc.returncode if proc.returncode is not None else -1,
             stdout=stdout,
             stderr=stderr,
         )
+        if process_cancelled(process_token):
+            raise ScanCancelledError("Scan process terminated by cancel")
+        return completed
     finally:
         _unregister_process(process_token, proc)
         for stream in (proc.stdout, proc.stderr):
@@ -306,8 +350,6 @@ def _parse_naabu_output(stdout: str) -> List[int]:
             if tail.isdigit():
                 ports.append(int(tail))
                 continue
-        for match in PORT_TOKEN_RE.finditer(line):
-            ports.append(int(match.group(1)))
     return _normalize_ports(ports)
 
 
@@ -325,8 +367,21 @@ def _parse_rustscan_output(stdout: str) -> List[int]:
                 if token.isdigit():
                     ports.append(int(token))
             continue
-        for match in PORT_TOKEN_RE.finditer(line):
-            ports.append(int(match.group(1)))
+        endpoint_match = re.fullmatch(
+            r"(?:Open\s+)?(?:\[[0-9A-Fa-f:.%]+\]|[A-Za-z0-9_.-]+):([1-9]\d{0,4})",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if endpoint_match:
+            ports.append(int(endpoint_match.group(1)))
+            continue
+        port_only_match = re.fullmatch(
+            r"Open\s+([1-9]\d{0,4})",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if port_only_match:
+            ports.append(int(port_only_match.group(1)))
     return _normalize_ports(ports)
 
 
@@ -401,8 +456,11 @@ def discover_open_ports(
     except FileNotFoundError as exc:
         raise DiscoveryError(f"{resolved} not found on PATH") from exc
 
-    # Discovery tools often exit non-zero when zero ports are found; still parse stdout.
     ports = parser(completed.stdout or "")
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()[:2000]
+        suffix = f": {detail}" if detail else ""
+        raise DiscoveryError(f"{resolved} exited with status {completed.returncode}{suffix}")
     return {
         "engine": resolved,
         "command": command,
@@ -432,7 +490,7 @@ def ensure_operator_result(
         raise ValueError("payload.hosts must be a list")
     if not hosts:
         out = dict(payload)
-        out.setdefault("schema", SCHEMA_VERSION)
+        out["schema"] = SCHEMA_VERSION
         out.setdefault("product", PRODUCT_NAME)
         out.setdefault("target", target or payload.get("target") or "")
         out.setdefault("scan_type", scan_type or payload.get("scan_type") or "")
@@ -440,7 +498,7 @@ def ensure_operator_result(
     first = hosts[0] if isinstance(hosts[0], dict) else {}
     if "protocols" in first:
         out = dict(payload)
-        out.setdefault("schema", SCHEMA_VERSION)
+        out["schema"] = SCHEMA_VERSION
         out.setdefault("product", PRODUCT_NAME)
         if target and not out.get("target"):
             out["target"] = target
@@ -494,6 +552,10 @@ def report_to_api_result(
                     "name": service.get("name") or "unknown",
                     "product": service.get("product") or "unknown",
                     "version": service.get("version") or "unknown",
+                    "extrainfo": service.get("extrainfo") or "",
+                    "tunnel": service.get("tunnel") or "",
+                    "reason": port.get("reason") or "",
+                    "scripts": list(port.get("scripts") or []),
                 }
             )
         for port_list in protocols.values():
@@ -505,6 +567,9 @@ def report_to_api_result(
                 "hostname": hostname or "N/A",
                 "state": host.get("status") or "unknown",
                 "protocols": protocols,
+                "host_scripts": list(host.get("host_scripts") or []),
+                "os_matches": list(host.get("os_matches") or []),
+                "trace": host.get("trace"),
             }
         )
 
@@ -763,7 +828,7 @@ def run_nmap_scan(
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "").strip()
             # Negative or signalled exits after cancel.
-            if process_token and completed.returncode in (
+            if process_cancelled(process_token) and completed.returncode in (
                 -signal.SIGTERM,
                 -signal.SIGKILL,
                 137,
@@ -774,7 +839,7 @@ def run_nmap_scan(
             raise NmapScanError(f"nmap exited with status {completed.returncode}{suffix}")
 
         if not xml_path.is_file() or xml_path.stat().st_size == 0:
-            if process_token:
+            if process_cancelled(process_token):
                 # Cancelled mid-write can leave empty XML.
                 raise ScanCancelledError("Scan cancelled before XML was produced")
             raise NmapScanError("nmap finished without producing XML output")

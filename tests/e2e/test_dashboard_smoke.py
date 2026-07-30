@@ -2,7 +2,7 @@
 
 Run only in the CI e2e job (or locally with browsers installed):
 
-    RUN_E2E=1 python -m unittest discover -s e2e -v
+    RUN_E2E=1 python -m unittest discover -s tests/e2e -t . -v
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from helpers import DashboardServer
+from .helpers import DashboardServer
 
 
 @unittest.skipUnless(os.getenv("RUN_E2E") == "1", "Set RUN_E2E=1 to run Playwright smoke tests")

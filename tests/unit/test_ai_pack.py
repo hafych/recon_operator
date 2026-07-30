@@ -144,6 +144,39 @@ class AiPackBuilderTests(unittest.TestCase):
         self.assertNotIn("test-token", body)
         self.assertNotIn(os.environ["FERNET_KEY"], body)
 
+    def test_small_json_cap_and_source_truncation_are_truthful(self):
+        hosts = [
+            {
+                "host": f"192.0.2.{index}",
+                "state": "up",
+                "protocols": {
+                    "tcp": [
+                        {
+                            "port": 8000 + offset,
+                            "state": "open",
+                            "name": "http",
+                            "product": "x" * 80,
+                        }
+                        for offset in range(5)
+                    ]
+                },
+            }
+            for index in range(1, 11)
+        ]
+        scan = {"target": "192.0.2.0/28", "scan_type": "Version", "hosts": hosts}
+
+        body, _, rows = build_ai_pack(scan, budget="s", format="json")
+        encoded_size = len(body.encode("utf-8"))
+        meta = rows[0]
+
+        self.assertLessEqual(encoded_size, BUDGET_S_MAX_BYTES)
+        self.assertEqual(meta["bytes"], encoded_size)
+        self.assertEqual(meta["hosts"], 8)
+        self.assertEqual(meta["hosts_total"], 10)
+        self.assertEqual(meta["open_services_total"], 50)
+        self.assertTrue(meta["source_truncated"])
+        self.assertTrue(meta["truncated"])
+
     def test_medium_pack_is_strictly_larger_than_small(self):
         rows_s = build_ai_pack_rows(SCAN, budget="s", inventory=INVENTORY)
         rows_m = build_ai_pack_rows(SCAN, budget="m", inventory=INVENTORY)

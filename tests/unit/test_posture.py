@@ -66,6 +66,32 @@ class PostureUnitTests(unittest.TestCase):
         loaded = load_expected_posture(json.dumps(EXPECTED))
         self.assertEqual(len(loaded["services"]), 2)
 
+    def test_wrong_service_on_expected_port_is_both_missing_and_unexpected(self):
+        report = evaluate_posture(
+            {
+                "hosts": [
+                    {
+                        "host": "APP.EXAMPLE.TEST.",
+                        "protocols": {"TCP": [{"port": 22, "state": "OPEN", "name": "http"}]},
+                    }
+                ]
+            },
+            {
+                "deny_unexpected": True,
+                "services": [
+                    {
+                        "host": "app.example.test",
+                        "proto": "tcp",
+                        "port": 22,
+                        "name": "ssh",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(report["missing"], 1)
+        self.assertEqual(report["unexpected"], 1)
+
 
 class PostureHttpTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

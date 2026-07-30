@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -118,7 +119,9 @@ class ScanEngineUnitTests(unittest.TestCase):
         self.assertIn("-sV", command)
 
     def test_parse_naabu_and_rustscan_outputs(self):
-        naabu = scan_engine._parse_naabu_output('{"ip":"127.0.0.1","port":22}\n127.0.0.1:80\n')
+        naabu = scan_engine._parse_naabu_output(
+            '{"ip":"127.0.0.1","port":22}\n127.0.0.1:80\nprogress 99\n'
+        )
         rust = scan_engine._parse_rustscan_output("127.0.0.1 -> [22,443]\nOpen 10.0.0.1:8080\n")
         self.assertEqual(naabu, [22, 80])
         self.assertIn(22, rust)
@@ -156,6 +159,78 @@ class ScanEngineUnitTests(unittest.TestCase):
         self.assertEqual(result["scan_type"], "Hybrid")
         self.assertEqual(result["discovery"]["ports"], [22, 80])
         self.assertEqual(result["nmap_profile"], "Version")
+
+    def test_discovery_nonzero_is_failure_even_when_stdout_contains_ports(self):
+        completed = subprocess.CompletedProcess(
+            ["naabu"],
+            returncode=2,
+            stdout='{"port":22}\n',
+            stderr="probe failed",
+        )
+        with (
+            mock.patch("scan_engine.resolve_discovery_engine", return_value="naabu"),
+            mock.patch("scan_engine.shutil.which", return_value="/usr/bin/naabu"),
+            mock.patch("scan_engine._run_tracked", return_value=completed),
+        ):
+            with self.assertRaisesRegex(scan_engine.DiscoveryError, "status 2"):
+                scan_engine.discover_open_ports("127.0.0.1")
+
+    def test_cancellation_before_registration_prevents_process_start(self):
+        token = "cancel-before-popen"
+        scan_engine.prepare_process_token(token)
+        scan_engine.mark_process_cancelled(token)
+        try:
+            with mock.patch("scan_engine.subprocess.Popen") as popen:
+                with self.assertRaises(scan_engine.ScanCancelledError):
+                    scan_engine._run_tracked(
+                        ["/usr/bin/true"],
+                        timeout=1,
+                        process_token=token,
+                    )
+            popen.assert_not_called()
+        finally:
+            scan_engine.clear_process_token(token)
+
+    def test_report_bridge_preserves_script_os_trace_and_reason_evidence(self):
+        report = {
+            "hosts": [
+                {
+                    "id": "192.0.2.1",
+                    "status": "up",
+                    "hostnames": [],
+                    "ports": [
+                        {
+                            "protocol": "tcp",
+                            "port": 443,
+                            "state": "open",
+                            "reason": "syn-ack",
+                            "service": {
+                                "name": "https",
+                                "product": "nginx",
+                                "version": "1",
+                                "extrainfo": "tls",
+                                "tunnel": "ssl",
+                            },
+                            "scripts": [{"id": "http-title", "output": "Home"}],
+                        }
+                    ],
+                    "host_scripts": [{"id": "uptime", "output": "1 day"}],
+                    "os_matches": [{"name": "Linux", "accuracy": "98"}],
+                    "trace": {"hops": [{"ttl": "1", "ip": "192.0.2.254"}]},
+                }
+            ]
+        }
+
+        result = scan_engine.report_to_api_result(report, target="192.0.2.1", scan_type="Safe")
+        host = result["hosts"][0]
+        port = host["protocols"]["tcp"][0]
+
+        self.assertEqual(port["reason"], "syn-ack")
+        self.assertEqual(port["tunnel"], "ssl")
+        self.assertEqual(port["scripts"][0]["id"], "http-title")
+        self.assertEqual(host["host_scripts"][0]["id"], "uptime")
+        self.assertEqual(host["os_matches"][0]["name"], "Linux")
+        self.assertEqual(host["trace"]["hops"][0]["ttl"], "1")
 
     def test_diff_detects_opened_port(self):
         baseline = {

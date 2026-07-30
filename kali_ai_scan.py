@@ -8,6 +8,7 @@ authorized assessment. XML parsing uses defusedxml for untrusted input safety.
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -18,6 +19,9 @@ import tempfile
 from pathlib import Path
 
 from defusedxml import ElementTree as ET
+from dotenv import load_dotenv
+
+load_dotenv()
 
 SCHEMA_VERSION = "ai-nmap-report/v1"
 MAX_XML_BYTES = 64 * 1024 * 1024
@@ -32,6 +36,10 @@ TARGET_RE = re.compile(r"^[A-Za-z0-9_.:/,*?\[\]-]+$")
 NMAP_DURATION_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?:ms|s|m|h)?$")
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+MAX_SCRIPT_ROWS = 256
+MAX_SCRIPT_OUTPUT_CHARS = 20_000
+MAX_OS_MATCHES = 32
+MAX_TRACE_HOPS = 256
 AI_REPORTS_MAX_DIRS = int(os.getenv("AI_REPORTS_MAX_DIRS", "100"))
 AI_REPORTS_MAX_AGE_DAYS = int(os.getenv("AI_REPORTS_MAX_AGE_DAYS", "0"))
 
@@ -41,7 +49,7 @@ def utc_now() -> str:
 
 
 def reject_suspicious_target(target: str) -> None:
-    if not target or len(target) > 512 or not TARGET_RE.match(target):
+    if not target or target.startswith("-") or len(target) > 512 or not TARGET_RE.match(target):
         raise SystemExit("Refusing suspicious target syntax. Use a host, IP, CIDR, or Nmap range.")
 
 
@@ -100,6 +108,16 @@ def primary_host_id(host: dict) -> str:
     return "unknown"
 
 
+def _parse_script_rows(nodes) -> list:
+    rows = []
+    for node in list(nodes)[:MAX_SCRIPT_ROWS]:
+        script_id = str(node.attrib.get("id") or "").strip()[:200]
+        output = str(node.attrib.get("output") or "")[:MAX_SCRIPT_OUTPUT_CHARS]
+        if script_id or output:
+            rows.append({"id": script_id, "output": output})
+    return rows
+
+
 def parse_nmap_xml(xml_path: Path) -> dict:
     if not xml_path.is_file():
         raise FileNotFoundError(f"Nmap XML file not found: {xml_path}")
@@ -132,6 +150,7 @@ def parse_nmap_xml(xml_path: Path) -> dict:
                 continue
             state_node = port_node.find("state")
             service_node = port_node.find("service")
+            script_rows = _parse_script_rows(port_node.findall("script"))
             ports.append(
                 {
                     "protocol": port_node.attrib.get("protocol", ""),
@@ -157,8 +176,43 @@ def parse_nmap_xml(xml_path: Path) -> dict:
                         if service_node is not None
                         else "",
                     },
+                    "scripts": script_rows,
                 }
             )
+
+        host_scripts = _parse_script_rows(host_node.findall("./hostscript/script"))
+        os_matches = []
+        for match in host_node.findall("./os/osmatch")[:MAX_OS_MATCHES]:
+            classes = [
+                {
+                    key: str(class_node.attrib.get(key) or "")[:200]
+                    for key in ("type", "vendor", "osfamily", "osgen", "accuracy")
+                }
+                for class_node in match.findall("osclass")[:16]
+            ]
+            os_matches.append(
+                {
+                    "name": str(match.attrib.get("name") or "")[:500],
+                    "accuracy": str(match.attrib.get("accuracy") or "")[:20],
+                    "classes": classes,
+                }
+            )
+        trace_node = host_node.find("trace")
+        trace = None
+        if trace_node is not None:
+            trace = {
+                "port": str(trace_node.attrib.get("port") or "")[:20],
+                "protocol": str(trace_node.attrib.get("proto") or "")[:20],
+                "hops": [
+                    {
+                        "ttl": str(hop.attrib.get("ttl") or "")[:20],
+                        "ip": str(hop.attrib.get("ipaddr") or "")[:200],
+                        "rtt": str(hop.attrib.get("rtt") or "")[:40],
+                        "host": str(hop.attrib.get("host") or "")[:500],
+                    }
+                    for hop in trace_node.findall("hop")[:MAX_TRACE_HOPS]
+                ],
+            }
 
         host = {
             "id": "",
@@ -168,6 +222,9 @@ def parse_nmap_xml(xml_path: Path) -> dict:
             "addresses": addresses,
             "hostnames": hostnames,
             "ports": sorted(ports, key=lambda item: (item["protocol"], item["port"])),
+            "host_scripts": host_scripts,
+            "os_matches": os_matches,
+            "trace": trace,
         }
         host["id"] = primary_host_id(host)
         hosts.append(host)
@@ -245,6 +302,9 @@ def write_observations(path: Path, report: dict) -> None:
                     "status": host["status"],
                     "addresses": host["addresses"],
                     "hostnames": host["hostnames"],
+                    "host_scripts": host.get("host_scripts") or [],
+                    "os_matches": host.get("os_matches") or [],
+                    "trace": host.get("trace"),
                 },
                 ensure_ascii=False,
             )
@@ -261,6 +321,7 @@ def write_observations(path: Path, report: dict) -> None:
                         "protocol": port["protocol"],
                         "state": port["state"],
                         "service": port["service"],
+                        "scripts": port.get("scripts") or [],
                         "llm_hint": f"{host['id']} has {port['protocol']}/{port['port']} {port['state']} ({service_name})",
                     },
                     ensure_ascii=False,
@@ -287,6 +348,14 @@ def write_markdown(path: Path, report: dict) -> None:
         lines.append(f"### {host['id']} ({host['status']})")
         if host["hostnames"]:
             lines.append(f"- Hostnames: {', '.join(host['hostnames'])}")
+        for match in host.get("os_matches") or []:
+            lines.append(
+                f"- OS match: {match.get('name') or 'unknown'} "
+                f"({match.get('accuracy') or '?'}% accuracy)"
+            )
+        for script in host.get("host_scripts") or []:
+            output = str(script.get("output") or "").replace("\n", " ").strip()
+            lines.append(f"- Host script `{script.get('id') or 'unknown'}`: {output}")
         open_ports = [port for port in host["ports"] if port["state"] == "open"]
         if not open_ports:
             lines.append("- Open ports: none observed")
@@ -300,38 +369,65 @@ def write_markdown(path: Path, report: dict) -> None:
             )
             suffix = f" - {product}" if product else ""
             lines.append(f"- `{port['protocol']}/{port['port']}` {label}{suffix}")
+            for script in port.get("scripts") or []:
+                output = str(script.get("output") or "").replace("\n", " ").strip()
+                lines.append(f"  - Script `{script.get('id') or 'unknown'}`: {output}")
         lines.append("")
 
     _write_private_text(path, "\n".join(lines).rstrip() + "\n")
 
 
-def apply_report_retention(root: Path) -> dict:
+def apply_report_retention(root: Path, *, managed_only: bool = False) -> dict:
     """Delete old CLI report directories by count and optional age."""
     if not root.is_dir():
         return {"deleted": 0, "remaining": 0}
 
-    dirs = [path for path in root.iterdir() if path.is_dir()]
-    deleted = 0
-    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    report_name = re.compile(r"^\d{8}_\d{6}(?:_\d{6})?_.+")
+    lock_path = root / ".retention.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        os.chmod(lock_path, PRIVATE_FILE_MODE)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        dirs = [
+            path
+            for path in root.iterdir()
+            if path.is_dir()
+            and (
+                not managed_only
+                or (report_name.fullmatch(path.name) and (path / "manifest.json").is_file())
+            )
+        ]
+        deleted = 0
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
 
-    if AI_REPORTS_MAX_AGE_DAYS > 0:
-        max_age = AI_REPORTS_MAX_AGE_DAYS * 86400
-        for path in list(dirs):
+        if AI_REPORTS_MAX_AGE_DAYS > 0:
+            max_age = AI_REPORTS_MAX_AGE_DAYS * 86400
+            for path in list(dirs):
+                try:
+                    if now - path.stat().st_mtime > max_age:
+                        shutil.rmtree(path)
+                        deleted += 1
+                        dirs.remove(path)
+                except OSError:
+                    continue
+
+        existing = []
+        for path in dirs:
             try:
-                if now - path.stat().st_mtime > max_age:
-                    shutil.rmtree(path, ignore_errors=True)
-                    deleted += 1
-                    dirs.remove(path)
+                existing.append((path.stat().st_mtime, path))
             except OSError:
                 continue
-
-    dirs.sort(key=lambda path: path.stat().st_mtime)
-    max_dirs = max(1, AI_REPORTS_MAX_DIRS)
-    while len(dirs) > max_dirs:
-        path = dirs.pop(0)
-        shutil.rmtree(path, ignore_errors=True)
-        deleted += 1
-    return {"deleted": deleted, "remaining": len(dirs)}
+        existing.sort(key=lambda item: item[0])
+        dirs = [path for _, path in existing]
+        max_dirs = max(1, AI_REPORTS_MAX_DIRS)
+        overflow = max(0, len(dirs) - max_dirs)
+        for path in list(dirs[:overflow]):
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                continue
+            deleted += 1
+            dirs.remove(path)
+        return {"deleted": deleted, "remaining": len(dirs)}
 
 
 def create_artifacts(xml_path: Path, out_dir: Path, manifest_extra: dict = None) -> dict:
@@ -377,10 +473,6 @@ def create_artifacts(xml_path: Path, out_dir: Path, manifest_extra: dict = None)
         manifest.update(manifest_extra)
 
     write_json(manifest_path, manifest)
-    try:
-        apply_report_retention(out_dir.parent)
-    except OSError:
-        pass
     return manifest
 
 
@@ -393,12 +485,15 @@ def run_scan(args: argparse.Namespace) -> int:
         return 127
 
     reject_suspicious_target(args.target)
-    scan_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(args.out) / f"{scan_id}_{re.sub(r'[^A-Za-z0-9_.-]+', '_', args.target)[:80]}"
-    _ensure_private_directory(out_dir)
+    scan_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_root = Path(args.out)
+    _ensure_private_directory(output_root)
+    out_dir = output_root / f"{scan_id}_{re.sub(r'[^A-Za-z0-9_.-]+', '_', args.target)[:80]}"
+    working_dir = Path(tempfile.mkdtemp(prefix=".in-progress-", dir=output_root))
+    working_dir.chmod(PRIVATE_DIRECTORY_MODE)
 
-    xml_path = out_dir / "nmap.xml"
-    normal_path = out_dir / "nmap.txt"
+    xml_path = working_dir / "nmap.xml"
+    normal_path = working_dir / "nmap.txt"
     _prepare_private_output(xml_path)
     _prepare_private_output(normal_path)
     command = [
@@ -420,27 +515,49 @@ def run_scan(args: argparse.Namespace) -> int:
             timeout=args.scan_timeout,
         )
     except subprocess.TimeoutExpired:
+        shutil.rmtree(working_dir, ignore_errors=True)
         print(
             f"nmap exceeded the {args.scan_timeout}-second scan timeout",
             file=sys.stderr,
         )
         return 124
+    except OSError as exc:
+        shutil.rmtree(working_dir, ignore_errors=True)
+        print(f"Unable to start nmap: {exc}", file=sys.stderr)
+        return 1
     if completed.returncode != 0:
+        shutil.rmtree(working_dir, ignore_errors=True)
         print(f"nmap exited with status {completed.returncode}", file=sys.stderr)
         return completed.returncode
 
-    manifest = create_artifacts(
-        xml_path,
-        out_dir,
-        {
-            "scan": {
-                "target": args.target,
-                "profile": args.profile,
-                "command": command,
-                "normal_output": str(normal_path),
-            }
-        },
-    )
+    try:
+        os.replace(working_dir, out_dir)
+    except OSError as exc:
+        shutil.rmtree(working_dir, ignore_errors=True)
+        print(f"Unable to publish report directory: {exc}", file=sys.stderr)
+        return 1
+    xml_path = out_dir / "nmap.xml"
+    normal_path = out_dir / "nmap.txt"
+    try:
+        manifest = create_artifacts(
+            xml_path,
+            out_dir,
+            {
+                "scan": {
+                    "target": args.target,
+                    "profile": args.profile,
+                    "command": command,
+                    "normal_output": str(normal_path),
+                }
+            },
+        )
+    except Exception:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
+    try:
+        apply_report_retention(Path(args.out), managed_only=True)
+    except OSError:
+        pass
     print(json.dumps({"manifest": manifest["artifacts"], "stats": manifest["stats"]}, indent=2))
     return 0
 

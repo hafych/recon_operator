@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 from defusedxml.common import EntitiesForbidden
 
@@ -22,13 +23,17 @@ SAMPLE_XML = """<?xml version="1.0"?>
     <ports>
       <port protocol="tcp" portid="22">
         <state state="open" reason="syn-ack"/>
-        <service name="ssh" product="OpenSSH" version="9.9"/>
+        <service name="ssh" product="OpenSSH" version="9.9" extrainfo="Ubuntu" tunnel="ssl"/>
+        <script id="banner" output="SSH server"/>
       </port>
       <port protocol="tcp" portid="80">
         <state state="closed" reason="reset"/>
         <service name="http"/>
       </port>
     </ports>
+    <hostscript><script id="uptime" output="1 day"/></hostscript>
+    <os><osmatch name="Linux" accuracy="98"><osclass vendor="Linux" osfamily="Linux"/></osmatch></os>
+    <trace port="22" proto="tcp"><hop ttl="1" ipaddr="127.0.0.1" rtt="0.1"/></trace>
   </host>
 </nmaprun>
 """
@@ -41,6 +46,8 @@ class KaliAiScanTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             kali_ai_scan.reject_suspicious_target("127.0.0.1; touch /tmp/owned")
+        with self.assertRaises(SystemExit):
+            kali_ai_scan.reject_suspicious_target("-iL")
 
     def test_parse_nmap_xml(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -54,6 +61,11 @@ class KaliAiScanTests(unittest.TestCase):
         self.assertEqual(report["stats"], {"hosts": 1, "hosts_up": 1, "open_ports": 1})
         self.assertEqual(report["hosts"][0]["id"], "127.0.0.1")
         self.assertEqual(report["hosts"][0]["ports"][0]["service"]["name"], "ssh")
+        self.assertEqual(report["hosts"][0]["ports"][0]["reason"], "syn-ack")
+        self.assertEqual(report["hosts"][0]["ports"][0]["scripts"][0]["id"], "banner")
+        self.assertEqual(report["hosts"][0]["host_scripts"][0]["id"], "uptime")
+        self.assertEqual(report["hosts"][0]["os_matches"][0]["name"], "Linux")
+        self.assertEqual(report["hosts"][0]["trace"]["hops"][0]["ttl"], "1")
 
     def test_write_observations_jsonl(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,6 +187,32 @@ class KaliAiScanTests(unittest.TestCase):
             for artifact in output_path.iterdir():
                 self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600, artifact.name)
             self.assertEqual(list(output_path.glob(".*.tmp")), [])
+
+    def test_failed_directory_publish_removes_in_progress_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = Namespace(
+                target="127.0.0.1",
+                out=tmp,
+                profile="tcp",
+                host_timeout="30s",
+                max_retries=1,
+                ports=None,
+                scan_timeout=10,
+            )
+            with (
+                mock.patch.object(kali_ai_scan.shutil, "which", return_value="/usr/bin/nmap"),
+                mock.patch.object(
+                    kali_ai_scan.subprocess,
+                    "run",
+                    return_value=mock.Mock(returncode=0),
+                ),
+                mock.patch.object(kali_ai_scan.os, "replace", side_effect=OSError("publish")),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                code = kali_ai_scan.run_scan(args)
+
+            self.assertEqual(code, 1)
+            self.assertEqual(list(Path(tmp).glob(".in-progress-*")), [])
 
 
 class CliValidationRegressionTests(unittest.TestCase):

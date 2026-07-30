@@ -21,5 +21,7 @@ if __name__ == "__main__":
         asyncio.run(_server.main())
     except KeyboardInterrupt:
         _server.log_event("KeyboardInterrupt received")
+        raise SystemExit(130)
     except Exception as e:  # pragma: no cover - process entry
         _server.log_event(f"Critical error: {e}")
+        raise SystemExit(1)

@@ -113,6 +113,21 @@ class MetricsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body.get("probes", {}).get("metrics"), "/metrics")
         self.assertIn("GET /metrics", body.get("endpoints", {}))
 
+    async def test_http_counter_and_metrics_openapi_policy_match_runtime(self):
+        await self.client.get("/live")
+        scrape = await self.client.get("/metrics")
+        text = await scrape.get_data(as_text=True)
+        self.assertIn("recon_operator_http_requests_total", text)
+        self.assertIn('route="/live"', text)
+
+        original = autonmap.METRICS_AUTH_REQUIRED
+        try:
+            autonmap.METRICS_AUTH_REQUIRED = True
+            spec = autonmap.build_openapi_spec()
+        finally:
+            autonmap.METRICS_AUTH_REQUIRED = original
+        self.assertEqual(spec["paths"]["/metrics"]["get"]["security"], [{"ApiKeyAuth": []}])
+
 
 if __name__ == "__main__":
     unittest.main()

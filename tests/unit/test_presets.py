@@ -35,13 +35,12 @@ class PresetUnitTests(unittest.TestCase):
         self.assertEqual(next_phase("map"), "safe")
         self.assertIsNone(get_preset("nope"))
 
-    def test_explicit_scan_type_overrides_preset(self):
+    def test_preset_rejects_incompatible_explicit_scan_type(self):
         merged, err = apply_preset_to_payload(
             {"target": "127.0.0.1", "preset": "map", "scan_type": "Ping"}
         )
-        self.assertIsNone(err)
-        assert merged is not None
-        self.assertEqual(merged["scan_type"], "Ping")
+        self.assertIsNone(merged)
+        self.assertIn("requires scan_type=Version", err)
 
 
 class PresetHttpTests(unittest.IsolatedAsyncioTestCase):

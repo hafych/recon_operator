@@ -8,6 +8,7 @@ only exposed here via lazy re-export for package-surface convenience.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import uuid
@@ -29,7 +30,14 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    raise RuntimeError(
+        f"{name} must be an explicit boolean (true/false, yes/no, on/off, 1/0), got: {value!r}"
+    )
 
 
 # When true, GET /metrics requires a valid API key with read scope (safer non-loopback).
@@ -99,18 +107,26 @@ def _load_trusted_proxies() -> List[str]:
                 ) from exc
             if not isinstance(parsed, list):
                 raise RuntimeError("TRUSTED_PROXIES JSON value must be an array of strings")
-            entries.extend(str(item).strip() for item in parsed if str(item).strip())
+            if any(not isinstance(item, str) or not item.strip() for item in parsed):
+                raise RuntimeError("TRUSTED_PROXIES JSON value must contain non-empty strings only")
+            entries.extend(item.strip() for item in parsed)
         else:
             entries.extend(part.strip() for part in raw.split(",") if part.strip())
 
     unique: List[str] = []
     seen = set()
     for entry in entries:
-        key = entry.lower()
+        try:
+            if "/" in entry:
+                key = str(ipaddress.ip_network(entry, strict=False))
+            else:
+                key = str(ipaddress.ip_address(entry))
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid TRUSTED_PROXIES entry: {entry!r}") from exc
         if key in seen:
             continue
         seen.add(key)
-        unique.append(entry)
+        unique.append(key)
         if len(unique) > 1000:
             raise RuntimeError("TRUSTED_PROXIES exceeds 1000 entries")
     return unique
@@ -124,7 +140,10 @@ if TRUSTED_PROXY_MODE and not TRUSTED_PROXIES:
     )
 
 # Multi-worker job leases (SQLite claim + optional Redis fence).
-WORKER_ID = (os.getenv("WORKER_ID", "").strip() or f"worker-{uuid.uuid4().hex[:12]}")[:64]
+_configured_worker_id = os.getenv("WORKER_ID", "").strip()
+if len(_configured_worker_id) > 64:
+    raise RuntimeError("WORKER_ID must be at most 64 characters")
+WORKER_ID = _configured_worker_id or f"worker-{uuid.uuid4().hex[:12]}"
 JOB_LEASE_SECONDS = _parse_int_env("JOB_LEASE_SECONDS", default=90, min_value=15, max_value=3600)
 JOB_CLAIM_POLL_SECONDS = _parse_int_env(
     "JOB_CLAIM_POLL_SECONDS", default=2, min_value=1, max_value=60

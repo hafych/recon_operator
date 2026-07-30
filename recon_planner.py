@@ -18,6 +18,7 @@ HOSTNAME_RE = re.compile(
 SERVICE_PROFILES = [
     {
         "name": "web",
+        "protocols": {"tcp"},
         "ports": HTTP_PORTS,
         "services": {"http", "https", "http-proxy", "http-alt", "ssl/http"},
         "steps": [
@@ -49,6 +50,7 @@ SERVICE_PROFILES = [
     },
     {
         "name": "ssh",
+        "protocols": {"tcp"},
         "ports": {22, 2222},
         "services": {"ssh"},
         "steps": [
@@ -56,12 +58,13 @@ SERVICE_PROFILES = [
                 "tool": "ssh-audit",
                 "package": "ssh-audit",
                 "purpose": "Audit SSH algorithms and banner safely.",
-                "command": "ssh-audit {host}:{port}",
+                "command": "ssh-audit {endpoint}",
             }
         ],
     },
     {
         "name": "smb",
+        "protocols": {"tcp"},
         "ports": {139, 445},
         "services": {"microsoft-ds", "netbios-ssn", "smb"},
         "steps": [
@@ -87,6 +90,7 @@ SERVICE_PROFILES = [
     },
     {
         "name": "dns",
+        "protocols": {"tcp", "udp"},
         "ports": {53},
         "services": {"domain", "dns"},
         "steps": [
@@ -101,11 +105,13 @@ SERVICE_PROFILES = [
                 "package": "dnsrecon",
                 "purpose": "Run DNS enumeration for the authorized target name.",
                 "command": "dnsrecon -d {name} -n {host}",
+                "requires_hostname": True,
             },
         ],
     },
     {
         "name": "tls",
+        "protocols": {"tcp"},
         "ports": TLS_PORTS,
         "services": {"ssl", "https", "ssl/http"},
         "steps": [
@@ -113,12 +119,13 @@ SERVICE_PROFILES = [
                 "tool": "sslscan",
                 "package": "sslscan",
                 "purpose": "Inspect TLS protocols and certificates.",
-                "command": "sslscan {host}:{port}",
+                "command": "sslscan {endpoint}",
             }
         ],
     },
     {
         "name": "ftp",
+        "protocols": {"tcp"},
         "ports": {21},
         "services": {"ftp"},
         "steps": [
@@ -132,6 +139,7 @@ SERVICE_PROFILES = [
     },
     {
         "name": "rpc",
+        "protocols": {"tcp"},
         "ports": {111},
         "services": {"rpcbind", "sunrpc"},
         "steps": [
@@ -149,22 +157,33 @@ SERVICE_PROFILES = [
 def _inventory_status(inventory: Dict) -> Dict[str, bool]:
     status = {}
     for package in inventory.get("packages", []) if inventory else []:
+        if not isinstance(package, dict):
+            continue
         package_ready = bool(package.get("installed") or package.get("command_available"))
-        status[package.get("package", "")] = package_ready
+        package_name = str(package.get("package") or "").strip()
+        if package_name:
+            status[package_name] = package_ready
         commands = package.get("commands", {})
         if isinstance(commands, dict):
             for command, path in commands.items():
-                status[command] = bool(path) or package_ready
+                command_name = str(command or "").strip()
+                if command_name:
+                    # An explicit command probe is more precise than package
+                    # installation state: installed packages can still lack a
+                    # particular binary or have a broken PATH.
+                    status[command_name] = bool(path)
         elif isinstance(commands, list):
             for command in commands:
                 if isinstance(command, dict):
-                    status[command.get("name", "")] = (
-                        bool(command.get("present") or command.get("path")) or package_ready
-                    )
+                    command_name = str(command.get("name") or "").strip()
+                    if command_name:
+                        status[command_name] = bool(command.get("present") or command.get("path"))
     return status
 
 
-def _service_matches(profile: Dict, port: int, service: str) -> bool:
+def _service_matches(profile: Dict, protocol: str, port: int, service: str) -> bool:
+    if protocol not in profile.get("protocols", {"tcp"}):
+        return False
     if port in profile["ports"]:
         return True
 
@@ -204,15 +223,22 @@ def _validated_host(value: object) -> str:
 
 def _validated_hostname(value: object) -> str:
     hostname = str(value or "").strip()
+    try:
+        ipaddress.ip_address(hostname.rstrip("."))
+        return ""
+    except ValueError:
+        pass
     return hostname.rstrip(".") if HOSTNAME_RE.fullmatch(hostname) else ""
 
 
 def _format_command(template: str, host: str, hostname: str, port: int, service: str) -> str:
     name = hostname if hostname and hostname != "N/A" else host
+    endpoint_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return template.format(
         host=shlex.quote(host),
         hostname=shlex.quote(hostname),
         name=shlex.quote(name),
+        endpoint=shlex.quote(f"{endpoint_host}:{port}"),
         port=port,
         service=shlex.quote(service),
         url=shlex.quote(_url(host, port, service)),
@@ -238,10 +264,13 @@ def build_recon_plan(scan: Dict, inventory: Dict = None) -> Dict:
         for protocol, ports in protocols.items():
             if not isinstance(ports, list):
                 continue
+            protocol = str(protocol or "").strip().lower()
+            if protocol not in {"tcp", "udp"}:
+                continue
             for port_row in ports:
                 if not isinstance(port_row, dict):
                     continue
-                if port_row.get("state") != "open":
+                if str(port_row.get("state") or "").lower() != "open":
                     continue
                 try:
                     port = int(port_row.get("port", 0))
@@ -251,15 +280,19 @@ def build_recon_plan(scan: Dict, inventory: Dict = None) -> Dict:
                     continue
                 service = str(port_row.get("name") or "unknown").lower()
                 for profile in SERVICE_PROFILES:
-                    if not _service_matches(profile, port, service):
+                    if not _service_matches(profile, protocol, port, service):
                         continue
                     for step in profile["steps"]:
+                        if step.get("requires_hostname") and not hostname:
+                            continue
                         command = _format_command(step["command"], host, hostname, port, service)
                         dedupe_key = (host, protocol, port, step["tool"], command)
                         if dedupe_key in seen:
                             continue
                         seen.add(dedupe_key)
-                        ready = tool_status.get(step["tool"]) or tool_status.get(step["package"])
+                        ready = tool_status.get(step["tool"])
+                        if ready is None:
+                            ready = tool_status.get(step["package"])
                         recommendations.append(
                             {
                                 "record_type": "recon_step",
@@ -272,9 +305,9 @@ def build_recon_plan(scan: Dict, inventory: Dict = None) -> Dict:
                                 "tool": step["tool"],
                                 "package": step["package"],
                                 "status": "ready"
-                                if ready
+                                if ready is True
                                 else "missing"
-                                if inventory
+                                if ready is False
                                 else "unknown",
                                 "purpose": step["purpose"],
                                 "command": command,

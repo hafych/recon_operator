@@ -8,6 +8,9 @@ const state = {
   toolsContext: "",
   view: "summary",
   apiHeader: "X-API-KEY",
+  apiAuthRequired: true,
+  authIdentity: null,
+  connectedToken: null,
   activeJobId: null,
   activeEngagementId: null,
   catalog: { presets: [], playbooks: [] },
@@ -15,6 +18,8 @@ const state = {
   tasks: [],
   historyIds: [],
   selectedResultId: null,
+  lastResultId: null,
+  previousResultId: null,
   lastRefreshAt: null,
   lastScanStartedAt: null,
   lastScanFinishedAt: null,
@@ -98,6 +103,38 @@ function saveToken() {
   const value = tokenInput.value;
   sessionStorage.setItem("recon_api_token", value);
   sessionStorage.setItem("nmap_api_token", value);
+}
+
+function resetOwnerWorkspace() {
+  state.lastResult = null;
+  state.previousResult = null;
+  state.lastResultId = null;
+  state.previousResultId = null;
+  state.lastPlan = null;
+  state.lastBrief = null;
+  state.lastDiff = null;
+  state.lastPosture = null;
+  state.toolsContext = "";
+  state.activeJobId = null;
+  state.activeEngagementId = null;
+  state.selectedResultId = null;
+  state.historyIds = [];
+  state.jobs = [];
+  state.tasks = [];
+  state.lastScanStartedAt = null;
+  state.lastScanFinishedAt = null;
+  state.lastScanDurationMs = null;
+  renderJobs([]);
+  renderTasks([]);
+  renderHistory([]);
+  renderPlaybookPreview();
+  $("toolsBox").value = "";
+  $("auditList").replaceChildren(
+    createElement("div", "empty-state", "Load audit events with an authorized admin key."),
+  );
+  $("postureOutput").textContent = "No posture evaluation yet.";
+  selectResultView("summary");
+  updateTimingPills();
 }
 
 function headers() {
@@ -262,7 +299,12 @@ function diffText(diff) {
     `Hosts added: ${summaryRow.hosts_added || 0}`,
     `Hosts removed: ${summaryRow.hosts_removed || 0}`,
   ];
-  const changes = report.changes || diff.changes || [];
+  const changes = report.changes || diff.changes || [
+    ...(report.ports_opened || []).map((change) => ({ ...change, type: "opened" })),
+    ...(report.ports_closed || []).map((change) => ({ ...change, type: "closed" })),
+    ...(report.hosts_added || []).map((host) => ({ host, type: "host added" })),
+    ...(report.hosts_removed || []).map((host) => ({ host, type: "host removed" })),
+  ];
   if (changes.length) {
     lines.push("", "Changes:");
     for (const change of changes) {
@@ -478,19 +520,32 @@ function renderPlaybookPreview(record = null) {
 }
 
 async function refreshKeyMeta() {
-  if (!tokenInput.value.trim()) {
+  const token = tokenInput.value.trim();
+  if (state.apiAuthRequired && !token) {
+    if (state.authIdentity !== null) resetOwnerWorkspace();
+    state.authIdentity = null;
+    state.connectedToken = null;
     $("keyMeta").textContent = "Key not identified.";
     setConnectionState("Not connected", "neutral");
     return false;
   }
   try {
     const key = await api("/auth/whoami");
+    const identity = key.owner_id_prefix || key.key_id || "local";
+    if (state.authIdentity !== null && state.authIdentity !== identity) {
+      resetOwnerWorkspace();
+    }
+    state.authIdentity = identity;
+    state.connectedToken = token;
     const scopes = Array.isArray(key.scopes) ? key.scopes.join(", ") : "unknown scopes";
     $("keyMeta").textContent = `${key.label || key.key_id || "API key"} · ${scopes}`;
     $("productVersion").textContent = key.version ? `v${key.version}` : "local";
     setConnectionState(key.label || key.key_id || "Connected", "success");
     return true;
   } catch (error) {
+    if (state.authIdentity !== null) resetOwnerWorkspace();
+    state.authIdentity = null;
+    state.connectedToken = null;
     $("keyMeta").textContent = error.message;
     setConnectionState("Authentication failed", "error");
     return false;
@@ -653,8 +708,13 @@ async function refresh({ announce = true } = {}) {
       $("apiStatus").textContent = health.status || "healthy";
       $("nmapStatus").textContent = health.nmap_available ? "ready" : "unavailable";
     } catch (error) {
+      health = error.body && typeof error.body === "object" ? error.body : null;
       $("apiStatus").textContent = error.status === 503 ? "degraded" : "offline";
       $("nmapStatus").textContent = "unknown";
+    }
+    if (health) {
+      state.apiHeader = health.api_auth_header || "X-API-KEY";
+      state.apiAuthRequired = health.api_auth_required !== false;
     }
 
     const authenticated = await refreshKeyMeta();
@@ -671,7 +731,14 @@ async function refresh({ announce = true } = {}) {
     }
     state.lastRefreshAt = Date.now();
     updateTimingPills();
-    if (announce) say(authenticated ? "Workspace refreshed." : "API is reachable. Connect a valid key to load operator data.", authenticated ? "success" : "warning");
+    if (announce) {
+      say(
+        authenticated
+          ? "Workspace refreshed."
+          : "API is reachable. Connect a valid key to load operator data.",
+        authenticated ? "success" : "warning",
+      );
+    }
   } catch (error) {
     say(error.message, "error");
   } finally {
@@ -713,7 +780,7 @@ async function openResult(id) {
   try {
     const payload = await api(`/results/${encodeURIComponent(id)}`);
     state.selectedResultId = id;
-    rememberResult(payload.result);
+    rememberResult(payload.result, id);
     selectResultView("summary");
     await refreshHistory({ announce: false });
     $("results").scrollIntoView({ block: "start", behavior: "smooth" });
@@ -787,11 +854,20 @@ async function refreshTools() {
   }
 }
 
-function rememberResult(result) {
-  if (state.lastResult && state.lastResult !== result) state.previousResult = state.lastResult;
+function rememberResult(result, sourceId = null) {
+  const normalizedId = sourceId ? String(sourceId) : null;
+  const isDifferent = normalizedId
+    ? normalizedId !== state.lastResultId
+    : state.lastResult !== null && state.lastResult !== result;
+  if (state.lastResult && isDifferent) {
+    state.previousResult = state.lastResult;
+    state.previousResultId = state.lastResultId;
+  }
   state.lastResult = result;
+  state.lastResultId = normalizedId;
   state.lastPlan = null;
   state.lastBrief = null;
+  state.lastDiff = null;
   state.lastPosture = null;
 }
 
@@ -874,7 +950,7 @@ async function runScan() {
     if (finished.status !== "completed") {
       throw new Error(finished.error || `Scan ${finished.status}`);
     }
-    rememberResult(finished.result);
+    rememberResult(finished.result, finished.result_file);
     state.selectedResultId = finished.result_file || null;
     selectResultView("summary");
     const duration = formatDuration(state.lastScanDurationMs) || "under 1s";
@@ -905,7 +981,7 @@ async function importXml() {
       method: "POST",
       body: JSON.stringify({ xml, target: $("target").value.trim() || "xml-import" }),
     });
-    rememberResult(payload.result);
+    rememberResult(payload.result, payload.filename);
     state.selectedResultId = payload.filename || null;
     selectResultView("summary");
     say("XML imported into encrypted history.", "success");
@@ -923,6 +999,13 @@ async function diffLastTwo() {
   try {
     let baseline = state.previousResult;
     let current = state.lastResult;
+    if (
+      state.previousResultId
+      && state.lastResultId
+      && state.previousResultId === state.lastResultId
+    ) {
+      baseline = null;
+    }
     if ((!baseline || !current) && state.historyIds.length >= 2) {
       const [newer, older] = state.historyIds;
       const [currentPayload, baselinePayload] = await Promise.all([
@@ -1178,7 +1261,16 @@ function exportCurrentView() {
   say(`Exported ${state.view.toUpperCase()} view.`, "success");
 }
 
-tokenInput.addEventListener("input", saveToken);
+tokenInput.addEventListener("input", () => {
+  const nextToken = tokenInput.value.trim();
+  if (state.connectedToken !== null && nextToken !== state.connectedToken) {
+    resetOwnerWorkspace();
+    state.authIdentity = null;
+    state.connectedToken = null;
+    setConnectionState("Not connected", "neutral");
+  }
+  saveToken();
+});
 $("connectBtn").addEventListener("click", async () => {
   saveToken();
   await refresh();
@@ -1187,11 +1279,11 @@ $("connectBtn").addEventListener("click", async () => {
 $("clearTokenBtn").addEventListener("click", () => {
   tokenInput.value = "";
   saveToken();
+  resetOwnerWorkspace();
+  state.authIdentity = null;
+  state.connectedToken = null;
   $("keyMeta").textContent = "Key not identified.";
   setConnectionState("Not connected", "neutral");
-  renderJobs([]);
-  renderTasks([]);
-  renderHistory([]);
   say("Token cleared from this tab session.", "info");
 });
 $("scanBtn").addEventListener("click", runScan);

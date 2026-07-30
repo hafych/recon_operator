@@ -15,9 +15,10 @@ python -m pip install -r requirements-dev.txt
 ```bash
 ruff format --check .
 ruff check .
-python -m coverage run -m unittest discover -v
+python -m coverage run -m unittest discover -s tests/unit -t . -v
 python -m coverage report
-bandit -q -ll -r . -x ./.venv,./test_autonmap.py,./test_decrypt.py,./test_kali_ai_scan.py,./test_recon_planner.py,./test_tool_inventory.py
+RUN_E2E=1 python -m unittest discover -s tests/e2e -t . -v
+bandit -q -ll -r . -x ./.venv,./tests
 pip-audit -r requirements.txt
 ```
 

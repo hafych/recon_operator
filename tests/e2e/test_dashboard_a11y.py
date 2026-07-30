@@ -1,6 +1,6 @@
 """axe-core accessibility regression for the operator dashboard.
 
-RUN_E2E=1 python -m unittest discover -s e2e -v
+RUN_E2E=1 python -m unittest discover -s tests/e2e -t . -v
 """
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from helpers import DashboardServer
+from .helpers import DashboardServer
 
 
 def _serious_violations(results) -> list[dict]:

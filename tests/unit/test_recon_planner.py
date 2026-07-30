@@ -121,6 +121,46 @@ class ReconPlannerTests(unittest.TestCase):
         self.assertTrue(commands)
         self.assertFalse(any("touch" in command or ";" in command for command in commands))
 
+    def test_protocol_ipv6_domain_and_partial_inventory_are_handled(self):
+        scan = {
+            "hosts": [
+                {
+                    "host": "2001:db8::10",
+                    "state": "up",
+                    "protocols": {
+                        "tcp": [{"port": 22, "state": "open", "name": "ssh"}],
+                        "udp": [
+                            {"port": 80, "state": "open", "name": "http"},
+                            {"port": 53, "state": "open", "name": "domain"},
+                        ],
+                    },
+                }
+            ]
+        }
+        inventory = {
+            "packages": [
+                {
+                    "package": "ssh-audit",
+                    "installed": True,
+                    "command_available": True,
+                    "commands": {"ssh-audit": None},
+                }
+            ]
+        }
+
+        plan = build_recon_plan(scan, inventory=inventory)
+        rows = plan["recommendations"]
+
+        ssh = next(row for row in rows if row["tool"] == "ssh-audit")
+        self.assertEqual(ssh["status"], "missing")
+        self.assertIn("[2001:db8::10]:22", ssh["command"])
+        self.assertFalse(any(row["profile"] == "web" and row["protocol"] == "udp" for row in rows))
+        self.assertTrue(any(row["tool"] == "dig" and row["protocol"] == "udp" for row in rows))
+        self.assertFalse(any(row["tool"] == "dnsrecon" for row in rows))
+        self.assertTrue(
+            all(row["status"] == "unknown" for row in rows if row["tool"] not in {"ssh-audit"})
+        )
+
 
 class ReconPlanApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

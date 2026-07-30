@@ -340,7 +340,7 @@ class ResultPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 autonmap.RESULTS_DIR = original_results_dir
                 autonmap.send_telegram_message = original_sender
 
-            files = os.listdir(tmp)
+            files = [name for name in os.listdir(tmp) if name.endswith(".json")]
             self.assertEqual(len(files), 1)
             self.assertEqual(filename, files[0])
             mode = stat.S_IMODE(os.stat(os.path.join(tmp, files[0])).st_mode)
@@ -391,6 +391,8 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("jobs_count", payload)
         self.assertIn("fernet_key_count", payload)
         self.assertGreaterEqual(payload["fernet_key_count"], 1)
+        self.assertEqual(payload["api_auth_header"], autonmap.API_AUTH_HEADER)
+        self.assertEqual(payload["api_auth_required"], autonmap.API_AUTH_REQUIRED)
 
     async def test_audit_requires_admin_and_lists_events(self):
         autonmap.record_audit_event(
@@ -444,6 +446,10 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(js_response.status_code, 200)
         self.assertIn("waitForJob", js_body)
         self.assertIn("observations", js_body)
+        self.assertIn("health.api_auth_header", js_body)
+        self.assertIn("health.api_auth_required", js_body)
+        self.assertIn("resetOwnerWorkspace", js_body)
+        self.assertIn("report.ports_opened", js_body)
         self.assertIn("public", js_response.headers.get("Cache-Control", ""))
 
         css_response = await self.client.get("/static/dashboard.css")
@@ -462,6 +468,19 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
         self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+
+    async def test_non_import_json_uses_the_smaller_route_body_limit(self):
+        original = autonmap.MAX_REQUEST_BODY_BYTES
+        autonmap.MAX_REQUEST_BODY_BYTES = 64
+        try:
+            response = await self.client.post(
+                "/scan",
+                headers={"X-API-KEY": "test-token", "Content-Type": "application/json"},
+                data=json.dumps({"target": "127.0.0.1", "padding": "x" * 100}),
+            )
+        finally:
+            autonmap.MAX_REQUEST_BODY_BYTES = original
+        self.assertEqual(response.status_code, 413)
 
     async def test_scan_queues_job_by_default(self):
         async def fake_create(
@@ -583,7 +602,12 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         original_results_dir = autonmap.RESULTS_DIR
         with tempfile.TemporaryDirectory() as tmp:
             autonmap.RESULTS_DIR = tmp
-            filename = await autonmap.save_scan_results_async(sample, "127.0.0.1", "Ping")
+            filename = await autonmap.save_scan_results_async(
+                sample,
+                "127.0.0.1",
+                "Ping",
+                owner_id=autonmap.owner_id_from_token("test-token"),
+            )
             list_response = await self.client.get("/results", headers={"X-API-KEY": "test-token"})
             list_payload = await list_response.get_json()
             get_response = await self.client.get(
@@ -958,9 +982,9 @@ class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "job_id": "j-adopt",
                     "target": "127.0.0.1",
                     "scan_type": "Ping",
-                    "status": "running",
+                    "status": "queued",
                     "created_at": "t0",
-                    "started_at": "t1",
+                    "started_at": None,
                     "kind": "immediate",
                     "owner_id": "local",
                     "lease_owner": autonmap.WORKER_ID,
@@ -974,18 +998,17 @@ class JobLeaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "finished_at": None,
                     "task": None,
                 }
+                autonmap.state_store.upsert_job(claimed)
                 await autonmap._adopt_claimed_job(claimed)
-                for _ in range(50):
-                    status = autonmap.scan_jobs["j-adopt"]["status"]
-                    if status in {"completed", "failed", "timeout"}:
-                        break
-                    await asyncio.sleep(0.02)
+                runner = autonmap.scan_jobs["j-adopt"]["task"]
+                await asyncio.wait_for(asyncio.shield(runner), timeout=2)
             finally:
                 autonmap.scan_network = original_scan
                 autonmap.send_telegram_message = original_sender
                 autonmap.RESULTS_DIR = original_results
                 autonmap.state_store.release_job_lease = original_release
                 autonmap._renew_job_lease = original_renew
+                autonmap.state_store.delete_job("j-adopt")
 
         self.assertEqual(autonmap.scan_jobs["j-adopt"]["status"], "completed")
 
@@ -1427,19 +1450,16 @@ class AuthAndCoverageRegressionTests(unittest.IsolatedAsyncioTestCase):
         def fake_list_tasks():
             return []
 
-        def fake_upsert(job):
-            self.assertEqual(job["status"], "queued")
-            self.assertIsNone(job.get("lease_owner"))
-
         original_jobs = autonmap.state_store.list_jobs
         original_tasks = autonmap.state_store.list_scheduled_tasks
         original_upsert = autonmap.state_store.upsert_job
         autonmap.state_store.list_jobs = fake_list_jobs
         autonmap.state_store.list_scheduled_tasks = fake_list_tasks
-        autonmap.state_store.upsert_job = fake_upsert
+        autonmap.state_store.upsert_job = mock.Mock()
         try:
             await autonmap.load_persisted_state()
-            self.assertEqual(autonmap.scan_jobs["inflight-1"]["status"], "queued")
+            self.assertEqual(autonmap.scan_jobs["inflight-1"]["status"], "running")
+            autonmap.state_store.upsert_job.assert_not_called()
         finally:
             autonmap.state_store.list_jobs = original_jobs
             autonmap.state_store.list_scheduled_tasks = original_tasks
@@ -1537,6 +1557,9 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(autonmap._parse_bool_env("BOOL_TEST_FLAG", False))
         with mock.patch.dict(os.environ, {"BOOL_TEST_FLAG": "0"}, clear=False):
             self.assertFalse(autonmap._parse_bool_env("BOOL_TEST_FLAG", True))
+        with mock.patch.dict(os.environ, {"BOOL_TEST_FLAG": "maybe"}, clear=False):
+            with self.assertRaises(RuntimeError):
+                autonmap._parse_bool_env("BOOL_TEST_FLAG", True)
 
         with mock.patch.dict(os.environ, {"INT_TEST_FLAG": "12"}, clear=False):
             self.assertEqual(
@@ -1689,14 +1712,16 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "result_file": None,
                 "kind": "immediate",
                 "owner_id": "local",
+                "lease_owner": autonmap.WORKER_ID,
+                "lease_until": time.time() + 60,
                 "task": None,
             }
+            autonmap.state_store.upsert_job(autonmap.scan_jobs["fail-job"])
 
             def boom(*_a, **_k):
                 raise RuntimeError("engine failed")
 
             autonmap.scan_network = boom
-            # already_claimed bypasses SQLite claim (unit path without prior persist).
             await autonmap._run_scan_job("fail-job", already_claimed=True)
             self.assertEqual(autonmap.scan_jobs["fail-job"]["status"], "failed")
             self.assertIn("engine failed", autonmap.scan_jobs["fail-job"]["error"])
@@ -1714,8 +1739,11 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "result_file": None,
                 "kind": "immediate",
                 "owner_id": "local",
+                "lease_owner": autonmap.WORKER_ID,
+                "lease_until": time.time() + 60,
                 "task": None,
             }
+            autonmap.state_store.upsert_job(autonmap.scan_jobs["timeout-job"])
 
             def timeout(*_a, **_k):
                 raise TimeoutError("took too long")
@@ -1726,6 +1754,8 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
         finally:
             autonmap.scan_network = original_scan
             autonmap.send_telegram_message = original_sender
+            autonmap.state_store.delete_job("fail-job")
+            autonmap.state_store.delete_job("timeout-job")
             autonmap.scan_jobs.clear()
 
     async def test_async_scan_returns_result_and_raises_on_failure(self):
@@ -1789,7 +1819,8 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("upsert failed")
 
             autonmap.state_store.upsert_job = boom_upsert
-            autonmap._persist_job({"job_id": "x", "status": "completed"})
+            with self.assertRaisesRegex(RuntimeError, "upsert failed"):
+                autonmap._persist_job({"job_id": "x", "status": "completed"})
         finally:
             autonmap.MAX_SCAN_JOBS = original_max
             autonmap.state_store.upsert_job = original_persist
@@ -2199,8 +2230,14 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             await autonmap.load_initial_tasks()
-            registered = {row["task_id"] for row in autonmap.state_store.list_scheduled_tasks()}
+            registered_rows = autonmap.state_store.list_scheduled_tasks()
+            registered = {row["task_id"] for row in registered_rows}
             self.assertTrue(any("Ping" in task_id for task_id in registered))
+            ping_row = next(row for row in registered_rows if row["scan_type"] == "Ping")
+            self.assertEqual(
+                ping_row["owner_id"],
+                autonmap.owner_id_from_token("test-token"),
+            )
             # Schedules are durable-only until a leader syncs them into memory.
             self.assertFalse(any("Ping" in task_id for task_id in autonmap.scan_tasks))
 
