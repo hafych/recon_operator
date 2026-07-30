@@ -1,6 +1,6 @@
 -r requirements.txt
 
-axe-playwright-python==0.1.7
+axe-playwright-python==0.1.8
 bandit==1.9.4
 coverage[toml]==7.15.0
 pip-audit==2.10.1
