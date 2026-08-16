@@ -1613,11 +1613,6 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(autonmap._normalize_scan_type("ping"), "Ping")
         self.assertIn("'Ping'", autonmap.get_scan_type_choices())
 
-        args = autonmap.build_scan_args("Ping")
-        self.assertIn("Ping", args)
-        with self.assertRaises(ValueError):
-            autonmap.build_scan_args("NotAType")
-
         self.assertFalse(autonmap.validate_ip_or_host(""))
         self.assertFalse(autonmap.validate_ip_or_host("host;rm"))
         self.assertFalse(autonmap.validate_ip_or_host("a" * 300))

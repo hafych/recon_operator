@@ -194,8 +194,16 @@ RESULTS_MAX_AGE_DAYS = _parse_int_env(
 # When false, result files without an owner prefix (pre-1.7 legacy) are hidden
 # from all operators. Prefer false for multi-token / semi-public deploys.
 LEGACY_RESULTS_SHARED = _parse_bool_env("LEGACY_RESULTS_SHARED", True)
+# When false, job/task rows without an owner (pre-1.7 legacy) are hidden from
+# operators and cannot be cancelled by them. Prefer false for multi-token deploys.
+LEGACY_JOBS_SHARED = _parse_bool_env("LEGACY_JOBS_SHARED", True)
+# 16 MiB: nmap XML imports are capped well below the request body limit to
+# bound XML parse time and memory on untrusted uploads.
+# When true, Telegram notifications include the scan target. Default false:
+# notification channels may be more broadly observable than the operator UI.
+TELEGRAM_INCLUDE_TARGET = _parse_bool_env("TELEGRAM_INCLUDE_TARGET", False)
 MAX_IMPORT_XML_BYTES = _parse_int_env(
-    "MAX_IMPORT_XML_BYTES", default=64 * 1024 * 1024, min_value=1024, max_value=64 * 1024 * 1024
+    "MAX_IMPORT_XML_BYTES", default=16 * 1024 * 1024, min_value=1024, max_value=64 * 1024 * 1024
 )
 STATE_DB_PATH = (
     os.getenv("STATE_DB_PATH", "data/recon_operator.db").strip() or "data/recon_operator.db"

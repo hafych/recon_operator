@@ -53,6 +53,9 @@ HYBRID_NMAP_PROFILE = "Version"
 
 PORTS_RE = re.compile(r"^[0-9A-Za-z:,\-]{1,200}$")
 SCRIPTS_RE = re.compile(r"^[A-Za-z0-9_.,+\-*/]{1,300}$")
+# Engine-side duplicate of the server target check: no whitespace, no shell
+# metacharacters, no leading dash (option injection), bounded length.
+TARGET_RE = re.compile(r"^[A-Za-z0-9._:/,\-\[\]?*]{1,512}$")
 
 
 class NmapNotFoundError(RuntimeError):
@@ -132,13 +135,33 @@ def _unregister_process(token: Optional[str], proc: Optional[subprocess.Popen] =
             _ACTIVE_PROCS.pop(token, None)
 
 
+def _process_group_id(proc: subprocess.Popen) -> Optional[int]:
+    """Return the process-group id only while it is still this process's own.
+
+    Processes are started with ``start_new_session=True``, making each one a
+    session/group leader (pgid == pid). If the pid was recycled after exit,
+    ``getpgid`` would return a foreign group that must never be signalled.
+    """
+    try:
+        group_id = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+    if group_id != proc.pid:
+        return None
+    return group_id
+
+
 def _terminate_process(proc: subprocess.Popen) -> None:
     """Terminate a process and its group (started with start_new_session=True)."""
     if proc.poll() is not None:
         return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
+    group_id = _process_group_id(proc)
+    if group_id is not None:
+        try:
+            os.killpg(group_id, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            group_id = None
+    if group_id is None:
         try:
             proc.terminate()
         except OSError:
@@ -148,9 +171,13 @@ def _terminate_process(proc: subprocess.Popen) -> None:
         return
     except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+    group_id = _process_group_id(proc)
+    if group_id is not None:
+        try:
+            os.killpg(group_id, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            group_id = None
+    if group_id is None:
         try:
             proc.kill()
         except OSError:
@@ -299,6 +326,14 @@ def build_nmap_command(
 ) -> List[str]:
     if scan_type not in SCAN_TYPE_ARGS:
         raise ValueError(f"Unsupported scan_type: {scan_type}")
+    # Defense in depth: re-validate at the engine boundary so no caller can
+    # slip option injection or oversized arguments past the scanner.
+    if not isinstance(target, str) or not TARGET_RE.fullmatch(target.strip()):
+        raise ValueError("target has invalid syntax (host, IP, CIDR, or Nmap range only)")
+    if ports is not None and (not isinstance(ports, str) or not PORTS_RE.fullmatch(ports)):
+        raise ValueError("ports has invalid syntax (Nmap -p expression expected)")
+    if scripts is not None and (not isinstance(scripts, str) or not SCRIPTS_RE.fullmatch(scripts)):
+        raise ValueError("scripts has invalid syntax (NSE names only)")
 
     executable = nmap_executable or shutil.which("nmap")
     if not executable:
@@ -317,7 +352,7 @@ def build_nmap_command(
     if scripts:
         # Allow extra scripts even when the profile already sets --script.
         command.extend(["--script", scripts])
-    command.extend(["-oX", str(xml_path), target])
+    command.extend(["-oX", str(xml_path), target.strip()])
     return command
 
 
@@ -826,7 +861,7 @@ def run_nmap_scan(
             raise NmapNotFoundError("nmap not found on PATH") from exc
 
         if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
+            detail = (completed.stderr or completed.stdout or "").strip()[:2000]
             # Negative or signalled exits after cancel.
             if process_cancelled(process_token) and completed.returncode in (
                 -signal.SIGTERM,

@@ -94,15 +94,27 @@ function updateTimingPills() {
   }
 }
 
+const TOKEN_STORAGE_KEY = "recon_operator.api_token.v1";
+
+function readStoredToken() {
+  // Legacy keys (pre-1.12) are read once for migration, never written.
+  return sessionStorage.getItem(TOKEN_STORAGE_KEY)
+    || sessionStorage.getItem("recon_api_token")
+    || sessionStorage.getItem("nmap_api_token")
+    || "";
+}
+
 const tokenInput = $("apiToken");
-tokenInput.value = sessionStorage.getItem("recon_api_token")
-  || sessionStorage.getItem("nmap_api_token")
-  || "";
+tokenInput.value = readStoredToken();
 
 function saveToken() {
-  const value = tokenInput.value;
-  sessionStorage.setItem("recon_api_token", value);
-  sessionStorage.setItem("nmap_api_token", value);
+  sessionStorage.setItem(TOKEN_STORAGE_KEY, tokenInput.value);
+}
+
+function clearStoredToken() {
+  sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+  sessionStorage.removeItem("recon_api_token");
+  sessionStorage.removeItem("nmap_api_token");
 }
 
 function resetOwnerWorkspace() {
@@ -174,10 +186,15 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Public endpoints never receive the API token (reduces exposure in
+// server/proxy logs on unauthenticated paths).
+const PUBLIC_PATHS = new Set(["/health", "/live", "/ready"]);
+
 async function api(path, options = {}) {
+  const requestHeaders = PUBLIC_PATHS.has(path) ? {} : headers();
   const response = await fetch(path, {
     ...options,
-    headers: { ...headers(), ...(options.headers || {}) },
+    headers: { ...requestHeaders, ...(options.headers || {}) },
   });
   const text = await response.text();
   let body;
@@ -713,7 +730,13 @@ async function refresh({ announce = true } = {}) {
       $("nmapStatus").textContent = "unknown";
     }
     if (health) {
-      state.apiHeader = health.api_auth_header || "X-API-KEY";
+      // Validate the advertised header name before trusting it; fall back to
+      // the well-known default so a tampered/unauthenticated response cannot
+      // steer the token into an unexpected header.
+      const advertised = String(health.api_auth_header || "");
+      state.apiHeader = /^[A-Za-z0-9_-]{1,64}$/.test(advertised)
+        ? advertised
+        : "X-API-KEY";
       state.apiAuthRequired = health.api_auth_required !== false;
     }
 
@@ -1269,7 +1292,6 @@ tokenInput.addEventListener("input", () => {
     state.connectedToken = null;
     setConnectionState("Not connected", "neutral");
   }
-  saveToken();
 });
 $("connectBtn").addEventListener("click", async () => {
   saveToken();
@@ -1278,7 +1300,7 @@ $("connectBtn").addEventListener("click", async () => {
 });
 $("clearTokenBtn").addEventListener("click", () => {
   tokenInput.value = "";
-  saveToken();
+  clearStoredToken();
   resetOwnerWorkspace();
   state.authIdentity = null;
   state.connectedToken = null;

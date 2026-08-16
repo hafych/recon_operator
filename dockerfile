@@ -8,8 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     APP_HOST=0.0.0.0 \
     RESULTS_DIR=/app/encrypted_results \
-    SCAN_LOG_PATH=/app/logs/scan_log.txt
-
+    SCAN_LOG_PATH=/app/logs/scan_log.txt \
+    # Private-by-default file creation for SQLite sidecars (-wal/-shm) and logs.
+    UMASK=077
 RUN apt-get update \
     && apt-get install --no-install-recommends -y nmap \
     && rm -rf /var/lib/apt/lists/* \
@@ -22,7 +23,8 @@ RUN python -m pip install -r requirements.txt
 
 COPY --chown=app:app . .
 RUN mkdir -p encrypted_results logs data \
-    && chown -R app:app encrypted_results logs data
+    && chown -R app:app encrypted_results logs data \
+    && chmod 700 encrypted_results logs data
 
 USER app
 EXPOSE 5000

@@ -8,6 +8,7 @@ Closed ports are omitted by default. No secrets are ever included.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from recon_operator.posture import load_expected_posture, posture_pack_rows
@@ -19,6 +20,52 @@ SCHEMA_VERSION = "recon-ai-pack/v1"
 # Hard caps for budget=s (enforced after build; builder also tries to stay under).
 BUDGET_S_MAX_BYTES = 4 * 1024
 BUDGET_S_MAX_LINES = 100
+
+# Hard byte caps for medium/large budgets (like budget=s, enforced after build).
+BUDGET_M_MAX_BYTES = 64 * 1024
+BUDGET_L_MAX_BYTES = 256 * 1024
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_text(value: Any, *, max_len: int = 200) -> Optional[str]:
+    """Strip control characters and bound length from untrusted scan data.
+
+    Scan fields (hostnames, banners, product/version strings, NSE output)
+    originate from remote hosts and may carry ANSI escapes, newlines, or
+    prompt-injection payloads aimed at LLM consumers of the pack. Normalize
+    them before emission so data cannot smuggle formatting or instructions.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    text = _CONTROL_CHARS_RE.sub(" ", text)
+    text = " ".join(text.split())
+    if len(text) > max_len:
+        text = text[:max_len]
+    text = text.strip()
+    return text or None
+
+
+def _budget_hard_bytes(budget_key: str) -> Optional[int]:
+    if budget_key == "s":
+        return BUDGET_S_MAX_BYTES
+    if budget_key == "m":
+        return BUDGET_M_MAX_BYTES
+    if budget_key == "l":
+        return BUDGET_L_MAX_BYTES
+    return None
+
+
+def _apply_hard_caps(rows: List[Dict[str, Any]], *, budget_key: str) -> List[Dict[str, Any]]:
+    """Enforce byte caps for the budget after build (s uses the stamping path)."""
+    max_bytes = _budget_hard_bytes(budget_key)
+    if max_bytes is None or not rows:
+        return rows
+    if budget_key == "s":
+        return _apply_budget_s_hard_caps(rows)
+    return _enforce_hard_caps(rows, max_lines=len(rows), max_bytes=max_bytes)
+
 
 # Soft targets used while building (leave headroom for meta).
 _BUDGET_LIMITS = {
@@ -132,13 +179,13 @@ def _iter_services(
     for host_row in hosts:
         if not isinstance(host_row, dict):
             continue
-        host = str(host_row.get("host") or "").strip()
+        host = _sanitize_text(host_row.get("host"), max_len=253)
         if not host:
             continue
-        hostname = host_row.get("hostname")
+        hostname = _sanitize_text(host_row.get("hostname"), max_len=253)
         if hostname in (None, "", "N/A"):
             hostname = None
-        host_state = str(host_row.get("state") or "unknown")
+        host_state = _sanitize_text(host_row.get("state"), max_len=32) or "unknown"
         protocols = host_row.get("protocols") or {}
         if not isinstance(protocols, dict):
             continue
@@ -164,9 +211,9 @@ def _iter_services(
                     "protocol": str(protocol or "tcp"),
                     "port": port,
                     "state": port_state,
-                    "name": str(port_row.get("name") or "unknown").lower(),
-                    "product": port_row.get("product"),
-                    "version": port_row.get("version"),
+                    "name": (_sanitize_text(port_row.get("name"), max_len=64) or "unknown").lower(),
+                    "product": _sanitize_text(port_row.get("product"), max_len=200),
+                    "version": _sanitize_text(port_row.get("version"), max_len=200),
                 }
 
 
@@ -255,17 +302,17 @@ def build_ai_pack_rows(
     for host_row in scan_hosts if isinstance(scan_hosts, list) else []:
         if not isinstance(host_row, dict):
             continue
-        host = str(host_row.get("host") or "").strip()
+        host = _sanitize_text(host_row.get("host"), max_len=253)
         if not host:
             continue
         if host not in host_meta:
             hosts_seen_all.append(host)
-            hostname = host_row.get("hostname")
+            hostname = _sanitize_text(host_row.get("hostname"), max_len=253)
             host_meta[host] = {
                 "t": "host",
                 "ip": host,
                 "hostname": hostname if hostname not in (None, "", "N/A") else None,
-                "status": str(host_row.get("state") or "unknown"),
+                "status": _sanitize_text(host_row.get("state"), max_len=32) or "unknown",
             }
 
     hosts_seen = hosts_seen_all[: int(limits["max_hosts"])]
@@ -296,8 +343,9 @@ def build_ai_pack_rows(
         "t": "meta",
         "schema": SCHEMA_VERSION,
         "budget": budget_key,
-        "target": scan.get("target"),
-        "scan_type": scan.get("scan_type"),
+        "target": _sanitize_text(scan.get("target"), max_len=253),
+        "scan_type": _sanitize_text(scan.get("scan_type"), max_len=64),
+        "data_is_untrusted": True,
         "open_services": len(open_services),
         "closed_services": len(closed_services),
         "hosts": len(hosts_seen),
@@ -311,9 +359,9 @@ def build_ai_pack_rows(
         "usage": "Prefer this pack over full result JSON in LLM context",
     }
     if job_id:
-        meta["job_id"] = str(job_id)[:64]
+        meta["job_id"] = _sanitize_text(job_id, max_len=64)
     if result_id:
-        meta["result_id"] = str(result_id)[:260]
+        meta["result_id"] = _sanitize_text(result_id, max_len=260)
     rows.append(meta)
 
     for host in hosts_seen:
@@ -395,13 +443,13 @@ def build_ai_pack_rows(
             rows.append(
                 {
                     "t": "next",
-                    "tool": rec.get("tool"),
-                    "status": rec.get("status"),
-                    "host": rec.get("host"),
+                    "tool": _sanitize_text(rec.get("tool"), max_len=64),
+                    "status": _sanitize_text(rec.get("status"), max_len=16),
+                    "host": _sanitize_text(rec.get("host"), max_len=253),
                     "port": rec.get("port"),
-                    "service": rec.get("service"),
-                    "cmd": rec.get("command"),
-                    "purpose": rec.get("purpose"),
+                    "service": _sanitize_text(rec.get("service"), max_len=64),
+                    "cmd": _sanitize_text(rec.get("command"), max_len=500),
+                    "purpose": _sanitize_text(rec.get("purpose"), max_len=200),
                 }
             )
             next_count += 1
@@ -411,17 +459,18 @@ def build_ai_pack_rows(
         for rec in missing:
             if gap_count >= int(limits["max_gap"]):
                 break
-            package = str(rec.get("package") or rec.get("tool") or "")
+            package = _sanitize_text(rec.get("package") or rec.get("tool"), max_len=64)
             if not package or package in seen_packages:
                 continue
             seen_packages.add(package)
+            tool = _sanitize_text(rec.get("tool"), max_len=64)
             rows.append(
                 {
                     "t": "gap",
-                    "tool": rec.get("tool"),
+                    "tool": tool,
                     "package": package,
                     "status": "missing",
-                    "hint": f"Install package '{package}' to enable {rec.get('tool')}",
+                    "hint": f"Install package '{package}' to enable {tool or 'the tool'}",
                 }
             )
             gap_count += 1
@@ -462,9 +511,8 @@ def build_ai_pack_rows(
         )
     rows.extend(ask_rows[: int(limits["max_ask"])])
 
-    # Enforce hard caps for budget=s after build (trim tail, keep meta).
-    if budget_key == "s":
-        rows = _apply_budget_s_hard_caps(rows)
+    # Enforce hard caps after build (trim tail, keep meta).
+    rows = _apply_hard_caps(rows, budget_key=budget_key)
 
     return rows
 
@@ -673,19 +721,20 @@ def _inventory_delta_rows(
     for rec in recommendations:
         if not isinstance(rec, dict):
             continue
-        package = str(rec.get("package") or rec.get("tool") or "").strip()
+        package = _sanitize_text(rec.get("package") or rec.get("tool"), max_len=64)
         if not package or package in seen:
             continue
         seen.add(package)
-        status = str(rec.get("status") or "unknown")
+        status = _sanitize_text(rec.get("status"), max_len=16) or "unknown"
+        service = _sanitize_text(rec.get("service"), max_len=64) or "service"
         rows.append(
             {
                 "t": "inv",
                 "package": package,
-                "tool": rec.get("tool"),
+                "tool": _sanitize_text(rec.get("tool"), max_len=64),
                 "status": status,
-                "service": rec.get("service"),
-                "reason": f"relevant to open {rec.get('service') or 'service'}",
+                "service": service,
+                "reason": f"relevant to open {service}",
             }
         )
         if len(rows) >= max_rows:
@@ -744,8 +793,8 @@ def build_retest_pack_rows(
     for item in diff.get("ports_opened") or []:
         if not isinstance(item, dict):
             continue
-        host = str(item.get("host") or "")
-        protocol = str(item.get("protocol") or "tcp")
+        host = _sanitize_text(item.get("host"), max_len=253) or ""
+        protocol = _sanitize_text(item.get("protocol"), max_len=16) or "tcp"
         try:
             port = int(item.get("port"))
         except (TypeError, ValueError):
@@ -758,7 +807,8 @@ def build_retest_pack_rows(
                 "host": host,
                 "port": port,
                 "proto": protocol,
-                "service": item.get("service") or item.get("name") or "unknown",
+                "service": _sanitize_text(item.get("service") or item.get("name"), max_len=64)
+                or "unknown",
             }
         )
         if len(change_rows) >= int(limits["max_changes"]):
@@ -767,8 +817,8 @@ def build_retest_pack_rows(
         for item in diff.get("ports_closed") or []:
             if not isinstance(item, dict):
                 continue
-            host = str(item.get("host") or "")
-            protocol = str(item.get("protocol") or "tcp")
+            host = _sanitize_text(item.get("host"), max_len=253) or ""
+            protocol = _sanitize_text(item.get("protocol"), max_len=16) or "tcp"
             try:
                 port = int(item.get("port"))
             except (TypeError, ValueError):
@@ -781,18 +831,18 @@ def build_retest_pack_rows(
                     "host": host,
                     "port": port,
                     "proto": protocol,
-                    "service": item.get("service") or item.get("name") or "unknown",
+                    "service": _sanitize_text(item.get("service") or item.get("name"), max_len=64)
+                    or "unknown",
                 }
             )
             if len(change_rows) >= int(limits["max_changes"]):
                 break
 
     rows = rows[:insert_at] + [diff_row] + change_rows + rows[insert_at:]
-    if budget_key == "s":
-        rows = _apply_budget_s_hard_caps(rows)
-        if rows and rows[0].get("t") == "meta":
-            rows[0] = dict(rows[0])
-            rows[0]["mode"] = "retest"
+    rows = _apply_hard_caps(rows, budget_key=budget_key)
+    if rows and rows[0].get("t") == "meta":
+        rows[0] = dict(rows[0])
+        rows[0]["mode"] = "retest"
     return rows
 
 

@@ -16,8 +16,10 @@ scanner and not an exploit framework.
 | Scan capability | scanning beyond engagement | `TARGET_ALLOWLIST`, target size bounds, auth + rate limits, job leases |
 | Encrypted results | key loss / unauthorized read | Fernet primary + `FERNET_PREVIOUS_KEYS`, owner-prefixed files, `LEGACY_RESULTS_SHARED` |
 | AI packs | exfil of secrets into LLM chat | packs never include tokens/keys; default `budget=s` hard size caps; prefer `/ai/pack` over full `/results` |
+| AI packs (prompt injection) | banner/NSE output smuggle instructions into LLM context | control characters and newlines stripped, field lengths bounded, `data_is_untrusted` marker, parser rejects illegal XML chars |
 | Metrics (`/metrics`) | internal state recon if exposed | **loopback-first deploy**; optional `METRICS_AUTH_REQUIRED=true` (read scope) |
 | Planner commands | blind execution | review-only suggestions (`ready`/`missing`); no auto-exec |
+| Telegram notifications | scan targets visible on external channels | target omitted unless `TELEGRAM_INCLUDE_TARGET=true` (default false) |
 
 ### Metrics exposure policy
 
@@ -41,7 +43,10 @@ contact channel without disclosing the vulnerability.
 - Prefer named keys (`API_AUTH_KEYS`) with least-privilege scopes (`read` / `scan` / `admin`)
   over a single shared admin token; revoke by setting `"revoked": true`.
 - For multi-token deploys, set `LEGACY_RESULTS_SHARED=false` so pre-ownership result files
-  are not visible to every operator.
+  are not visible to every operator, and `LEGACY_JOBS_SHARED=false` so pre-ownership
+  jobs/tasks are hidden and not cancellable by others.
+- Keep `TELEGRAM_INCLUDE_TARGET=false` (default) unless the notification channel is
+  as restricted as the operator UI; the flag also gates target text in scan errors.
 - Prefer an explicit `TARGET_ALLOWLIST` / `TARGET_ALLOWLIST_FILE` so scans cannot leave the
   authorized engagement scope (IPs, CIDRs, hostnames, or `*.suffix` wildcards).
 - For multi-worker deploys set `REDIS_URL` so rate limits are shared; without it each process

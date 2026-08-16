@@ -134,6 +134,8 @@ MAX_SCHEDULE_INTERVAL_MINUTES = _config.MAX_SCHEDULE_INTERVAL_MINUTES
 RESULTS_MAX_FILES = _config.RESULTS_MAX_FILES
 RESULTS_MAX_AGE_DAYS = _config.RESULTS_MAX_AGE_DAYS
 LEGACY_RESULTS_SHARED = _config.LEGACY_RESULTS_SHARED
+LEGACY_JOBS_SHARED = _config.LEGACY_JOBS_SHARED
+TELEGRAM_INCLUDE_TARGET = _config.TELEGRAM_INCLUDE_TARGET
 MAX_IMPORT_XML_BYTES = _config.MAX_IMPORT_XML_BYTES
 STATE_DB_PATH = _config.STATE_DB_PATH
 _load_target_allowlist = _config._load_target_allowlist
@@ -959,13 +961,6 @@ def _canonicalize_valid_target(target: str) -> str:
             return target.lower()
 
 
-def build_scan_args(scan_type: str) -> str:
-    """Legacy helper retained for tests and docs; engine builds argv lists."""
-    if scan_type not in SUPPORTED_SCAN_TYPES:
-        raise ValueError(f"Invalid scan_type: {scan_type}")
-    return f"{scan_type} --host-timeout {HOST_TIMEOUT_SEC}s --max-retries {NMAP_MAX_RETRIES}"
-
-
 def scan_network(
     target: str,
     scan_type: str,
@@ -1123,12 +1118,18 @@ async def save_scan_results_async(
             # must not turn a successful scan into a failed job.
             log_event(f"Result retention failed after saving {filename}: {exc}")
         log_event(f"Results saved to {path}")
-        await send_telegram_message(f"Scan {target} finished. Results: {filename}")
+        if TELEGRAM_INCLUDE_TARGET:
+            await send_telegram_message(f"Scan {target} finished. Results: {filename}")
+        else:
+            await send_telegram_message(f"Scan finished. Results: {filename}")
         return filename
     except Exception as e:
         err = f"Error saving results: {e}"
         log_event(err)
-        await send_telegram_message(f"Error saving results for {target}: {e}")
+        if TELEGRAM_INCLUDE_TARGET:
+            await send_telegram_message(f"Error saving results for {target}: {e}")
+        else:
+            await send_telegram_message(f"Error saving results: {e}")
         raise
 
 
@@ -1378,6 +1379,9 @@ async def _finalize_job(
     result: Optional[Dict[str, Any]] = None,
 ) -> bool:
     finished_at = _utc_now_iso()
+    if error is not None:
+        # Normalize error text for durability and UI: single line, bounded size.
+        error = " ".join(str(error).split())[:500] or None
     stored = await asyncio.to_thread(
         state_store.finalize_job,
         job_id,
@@ -2336,7 +2340,12 @@ async def list_jobs():
 
     owner = current_owner_id()
     try:
-        persisted = await asyncio.to_thread(state_store.list_jobs, MAX_SCAN_JOBS, owner)
+        persisted = await asyncio.to_thread(
+            state_store.list_jobs,
+            MAX_SCAN_JOBS,
+            owner,
+            legacy_shared=LEGACY_JOBS_SHARED,
+        )
     except Exception as exc:
         log_event(f"Failed to list persisted jobs: {exc}")
         persisted = []
@@ -2368,10 +2377,13 @@ async def get_job(job_id: str):
     if auth_error:
         return auth_error
 
+    owner = current_owner_id()
     job = await _refresh_job_from_store(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    if not job_visible_to_owner(job):
+    if not job_visible_to_owner(job, owner):
+        return jsonify({"error": "Job not found"}), 404
+    if LEGACY_JOBS_SHARED is False and job.get("owner_id") is None:
         return jsonify({"error": "Job not found"}), 404
     if job.get("status") == "completed" and not isinstance(job.get("result"), dict):
         loaded = await _load_job_result_payload(job)
@@ -2393,6 +2405,7 @@ async def _cancel_scan_job(
         owner_id,
         finished_at=finished_at,
         error="Scan cancelled",
+        legacy_shared=LEGACY_JOBS_SHARED,
     )
     if durable is None:
         # Compatibility for process-local jobs created by older integrations.
@@ -2782,7 +2795,11 @@ async def list_tasks():
     owner_prefix = f"o{owner_result_prefix(owner)[1:13]}-"
     _cleanup_finished_tasks()
     try:
-        rows = await asyncio.to_thread(state_store.list_scheduled_tasks)
+        rows = await asyncio.to_thread(
+            state_store.list_scheduled_tasks,
+            owner,
+            legacy_shared=LEGACY_JOBS_SHARED,
+        )
     except Exception as exc:
         log_event(f"Failed to list scheduled tasks: {exc}")
         rows = []
@@ -2793,8 +2810,11 @@ async def list_tasks():
         row_owner = row.get("owner_id")
         if row_owner and row_owner != owner:
             continue
-        if not row_owner and task_id.startswith("o") and not task_id.startswith(owner_prefix):
-            continue
+        if not row_owner:
+            if not LEGACY_JOBS_SHARED:
+                continue
+            if task_id.startswith("o") and not task_id.startswith(owner_prefix):
+                continue
         local = scan_tasks.get(task_id)
         tasks_info.append(
             {
@@ -2833,6 +2853,9 @@ async def cancel_task(task_id):
     owner = current_owner_id()
     owner_prefix = f"o{owner_result_prefix(owner)[1:13]}-"
     if task_id.startswith("o") and not task_id.startswith(owner_prefix):
+        return jsonify({"error": "Task not found"}), 404
+    if not task_id.startswith("o") and not LEGACY_JOBS_SHARED:
+        # Legacy unowned tasks are hidden from every operator in strict mode.
         return jsonify({"error": "Task not found"}), 404
 
     _cleanup_finished_tasks()
@@ -3308,8 +3331,9 @@ def _render_dashboard_html() -> tuple:
         f"default-src 'self'; "
         f"style-src 'self' 'nonce-{nonce}'; "
         f"script-src 'self' 'nonce-{nonce}'; "
-        f"connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; "
-        f"base-uri 'self'; form-action 'self'"
+        f"connect-src 'self'; img-src 'self' data:; object-src 'none'; "
+        f"frame-ancestors 'none'; base-uri 'self'; form-action 'self'; "
+        f"upgrade-insecure-requests"
     )
     return (
         html,
@@ -3460,6 +3484,7 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "results_max_files": RESULTS_MAX_FILES,
         "results_max_age_days": RESULTS_MAX_AGE_DAYS,
         "legacy_results_shared": LEGACY_RESULTS_SHARED,
+        "legacy_jobs_shared": LEGACY_JOBS_SHARED,
         "api_auth_required": API_AUTH_REQUIRED,
         "api_auth_header": API_AUTH_HEADER,
         "api_key_count": len([key for key in API_AUTH_KEYS if not key.get("revoked")]),
