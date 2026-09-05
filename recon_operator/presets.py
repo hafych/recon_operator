@@ -7,12 +7,12 @@ ad-hoc sequences. Presets never auto-exploit; they only select recon profiles.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 # Ordered engagement phases (playbook skeleton).
-PHASE_ORDER: List[str] = ["discovery", "map", "safe"]
+PHASE_ORDER: list[str] = ["discovery", "map", "safe"]
 
-PRESETS: Dict[str, Dict[str, Any]] = {
+PRESETS: dict[str, dict[str, Any]] = {
     "discovery": {
         "id": "discovery",
         "phase": "PB-DISC",
@@ -82,13 +82,13 @@ PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def list_presets() -> List[Dict[str, Any]]:
+def list_presets() -> list[dict[str, Any]]:
     rows = [dict(value) for value in PRESETS.values()]
     rows.sort(key=lambda item: (item.get("order") or 99, item.get("id") or ""))
     return rows
 
 
-def get_preset(preset_id: str) -> Optional[Dict[str, Any]]:
+def get_preset(preset_id: str) -> dict[str, Any] | None:
     key = str(preset_id or "").strip().lower()
     if not key:
         return None
@@ -97,8 +97,8 @@ def get_preset(preset_id: str) -> Optional[Dict[str, Any]]:
 
 
 def apply_preset_to_payload(
-    payload: Optional[Dict[str, Any]],
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    payload: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
     """Merge preset fields into a scan payload.
 
     Explicit payload keys may refine a preset, but cannot replace its scan
@@ -141,7 +141,7 @@ def apply_preset_to_payload(
     return data, None
 
 
-def next_phase(preset_id: str) -> Optional[str]:
+def next_phase(preset_id: str) -> str | None:
     """Return the next ordered engagement phase id after preset_id, if any."""
     key = str(preset_id or "").strip().lower()
     if key not in PHASE_ORDER:

@@ -6,7 +6,7 @@ import argparse
 import json
 import shutil
 import sys
-from typing import Dict, Iterable, List
+from collections.abc import Iterable
 
 from kali_ai_scan import apt_policy, run_command, utc_now
 
@@ -61,14 +61,14 @@ ESSENTIAL_TOOLS = {
 }
 
 
-def all_profile_packages() -> List[str]:
+def all_profile_packages() -> list[str]:
     packages = []
     for profile_packages in KALI_METAPACKAGE_PROFILES.values():
         packages.extend(profile_packages)
     return sorted(set(packages))
 
 
-def parse_apt_depends(stdout: str) -> List[str]:
+def parse_apt_depends(stdout: str) -> list[str]:
     packages = []
     for raw_line in stdout.splitlines():
         line = raw_line.strip()
@@ -81,7 +81,7 @@ def parse_apt_depends(stdout: str) -> List[str]:
     return sorted(set(packages))
 
 
-def metapackage_dependencies(package: str) -> List[str]:
+def metapackage_dependencies(package: str) -> list[str]:
     if not shutil.which("apt-cache"):
         return []
     result = run_command(["apt-cache", "depends", package])
@@ -90,7 +90,7 @@ def metapackage_dependencies(package: str) -> List[str]:
     return parse_apt_depends(result.get("stdout", ""))
 
 
-def package_status(package: str) -> Dict:
+def package_status(package: str) -> dict:
     result = run_command(
         ["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${db:Status-Status}\n", package]
     )
@@ -114,7 +114,7 @@ def package_status(package: str) -> Dict:
     }
 
 
-def selected_metapackages(profiles: Iterable[str] = None) -> List[str]:
+def selected_metapackages(profiles: Iterable[str] = None) -> list[str]:
     if profiles is None:
         return all_profile_packages()
 
@@ -124,7 +124,7 @@ def selected_metapackages(profiles: Iterable[str] = None) -> List[str]:
     return sorted(set(packages))
 
 
-def build_tool_inventory(profiles: Iterable[str] = None, expand: bool = False) -> Dict:
+def build_tool_inventory(profiles: Iterable[str] = None, expand: bool = False) -> dict:
     profile_names = (
         list(KALI_METAPACKAGE_PROFILES)
         if profiles is None
@@ -194,7 +194,7 @@ def build_tool_inventory(profiles: Iterable[str] = None, expand: bool = False) -
     }
 
 
-def inventory_to_jsonl(inventory: Dict) -> str:
+def inventory_to_jsonl(inventory: dict) -> str:
     rows = [
         {
             "schema": inventory["schema"],
@@ -233,7 +233,7 @@ def inventory_to_jsonl(inventory: Dict) -> str:
     return "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
 
 
-def inventory_to_markdown(inventory: Dict) -> str:
+def inventory_to_markdown(inventory: dict) -> str:
     lines = [
         "# Pentest Tool Inventory",
         "",
@@ -304,7 +304,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: List[str] = None) -> int:
+def main(argv: list[str] = None) -> int:
     parser = build_cli_parser()
     args = parser.parse_args(argv)
     inventory = build_tool_inventory(profiles=args.profiles, expand=args.expand)

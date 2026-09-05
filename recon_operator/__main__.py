@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 
 def _cmd_serve(_args: argparse.Namespace) -> int:
@@ -90,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     # Default to serve when no subcommand (backward compatible).
     if not argv_list or argv_list[0] not in {"serve", "pack", "presets", "-h", "--help"}:

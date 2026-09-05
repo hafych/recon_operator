@@ -67,6 +67,9 @@ jobs:
       - name: Ruff
         run: ruff format --check . && ruff check .
 
+      - name: Type check (non-blocking baseline)
+        run: mypy recon_operator scan_engine.py state_store.py || true
+
       - name: Security checks
         run: |
           bandit -q -ll -r . -x ./.venv,./tests

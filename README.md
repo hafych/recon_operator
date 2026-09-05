@@ -306,8 +306,8 @@ Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing th
 | `RESULTS_DIR` | `encrypted_results` | Encrypted result directory |
 | `RESULTS_MAX_FILES` | `500` | Max encrypted result files retained |
 | `RESULTS_MAX_AGE_DAYS` | `0` | Delete results older than N days (`0` = off) |
-| `LEGACY_RESULTS_SHARED` | `true` | Show pre-ownership result files to any auth operator; set `false` for multi-token isolation |
-| `LEGACY_JOBS_SHARED` | `true` | Show/cancel pre-ownership jobs and scheduled tasks to any auth operator; set `false` for multi-token isolation |
+| `LEGACY_RESULTS_SHARED` | `false` | Show pre-ownership result files to any auth operator; set `true` only for single-operator compat with pre-1.7 files |
+| `LEGACY_JOBS_SHARED` | `false` | Show/cancel pre-ownership jobs and scheduled tasks to any auth operator; set `true` only for single-operator compat |
 | `STATE_DB_PATH` | `data/recon_operator.db` | SQLite for jobs + scheduled tasks |
 | `AI_REPORTS_MAX_DIRS` | `100` | Max CLI `ai_reports` run directories retained |
 | `AI_REPORTS_MAX_AGE_DAYS` | `0` | Delete CLI report dirs older than N days (`0` = off) |

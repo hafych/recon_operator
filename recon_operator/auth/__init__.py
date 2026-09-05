@@ -15,7 +15,7 @@ import re
 import secrets
 import sys
 from importlib import import_module
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from quart import g, jsonify, request
 
@@ -24,7 +24,7 @@ API_KEY_SCOPES = frozenset({"read", "scan", "admin"})
 API_KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
-def _normalize_key_scopes(raw: Any) -> List[str]:
+def _normalize_key_scopes(raw: Any) -> list[str]:
     if raw is None:
         return ["admin"]
     if isinstance(raw, str):
@@ -42,7 +42,7 @@ def _normalize_key_scopes(raw: Any) -> List[str]:
             f"Allowed: {', '.join(sorted(API_KEY_SCOPES))}"
         )
     # Preserve declared order without duplicates.
-    ordered: List[str] = []
+    ordered: list[str] = []
     seen = set()
     for scope in values:
         if scope in seen:
@@ -52,7 +52,7 @@ def _normalize_key_scopes(raw: Any) -> List[str]:
     return ordered
 
 
-def _expand_scopes(scopes: List[str]) -> frozenset:
+def _expand_scopes(scopes: list[str]) -> frozenset:
     """admin ⊃ scan ⊃ read."""
     have = set(scopes)
     if "admin" in have:
@@ -62,7 +62,7 @@ def _expand_scopes(scopes: List[str]) -> frozenset:
     return frozenset(have)
 
 
-def _public_api_key_view(key: Dict[str, Any]) -> Dict[str, Any]:
+def _public_api_key_view(key: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": key["id"],
         "label": key.get("label") or key["id"],
@@ -72,7 +72,7 @@ def _public_api_key_view(key: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_api_auth_keys() -> List[Dict[str, Any]]:
+def _load_api_auth_keys() -> list[dict[str, Any]]:
     """Load named API keys and legacy raw tokens.
 
     Supports:
@@ -80,7 +80,7 @@ def _load_api_auth_keys() -> List[Dict[str, Any]]:
       ``{"id","label","token","scopes","created_at","revoked"}``
     - API_AUTH_TOKEN / API_AUTH_TOKENS (legacy full-access tokens)
     """
-    keys: List[Dict[str, Any]] = []
+    keys: list[dict[str, Any]] = []
     seen_tokens: set = set()
     seen_ids: set = set()
 
@@ -90,7 +90,7 @@ def _load_api_auth_keys() -> List[Dict[str, Any]]:
         label: str,
         token: str,
         scopes: Any,
-        created_at: Optional[str] = None,
+        created_at: str | None = None,
         revoked: bool = False,
     ) -> None:
         token = (token or "").strip()
@@ -151,7 +151,7 @@ def _load_api_auth_keys() -> List[Dict[str, Any]]:
 
     # Legacy multi-token list (full admin access).
     multi_raw = os.getenv("API_AUTH_TOKENS", "").strip()
-    legacy_tokens: List[str] = []
+    legacy_tokens: list[str] = []
     if multi_raw:
         if multi_raw.startswith("["):
             try:
@@ -193,12 +193,12 @@ def _load_api_auth_tokens() -> list:
     return [key["token"] for key in _load_api_auth_keys() if not key.get("revoked")]
 
 
-API_AUTH_KEYS: List[Dict[str, Any]] = []
-API_AUTH_TOKENS: List[str] = []
+API_AUTH_KEYS: list[dict[str, Any]] = []
+API_AUTH_TOKENS: list[str] = []
 API_AUTH_TOKEN = ""
 
 
-def reload_api_auth_registry() -> List[Dict[str, Any]]:
+def reload_api_auth_registry() -> list[dict[str, Any]]:
     """Reload the auth registry from the current process environment.
 
     ``unittest discover`` imports package directories before test modules. That
@@ -223,14 +223,14 @@ def _runtime_server():
     return sys.modules.get("recon_operator.server")
 
 
-def _live_api_auth_keys() -> List[Dict[str, Any]]:
+def _live_api_auth_keys() -> list[dict[str, Any]]:
     server = _runtime_server()
     if server is not None and hasattr(server, "API_AUTH_KEYS"):
         return server.API_AUTH_KEYS
     return API_AUTH_KEYS
 
 
-def _live_api_auth_tokens() -> List[str]:
+def _live_api_auth_tokens() -> list[str]:
     server = _runtime_server()
     if server is not None and hasattr(server, "API_AUTH_TOKENS"):
         return server.API_AUTH_TOKENS
@@ -255,26 +255,35 @@ def _live_api_auth_header() -> str:
     return str(config.API_AUTH_HEADER)
 
 
-def _resolve_api_key(candidate: str) -> Optional[Dict[str, Any]]:
+def _resolve_api_key(candidate: str) -> dict[str, Any] | None:
     """Return the matching non-revoked key record for a presented token."""
-    if not candidate:
+    if not candidate or not isinstance(candidate, str):
         return None
 
-    # Prefer structured key registry.
+    # Prefer structured key registry. Use compare_digest directly (it handles
+    # different lengths in constant time for str); avoid early len() checks
+    # that would leak token length via timing.
     for key in _live_api_auth_keys():
         if key.get("revoked"):
             continue
         allowed = str(key.get("token") or "")
-        if not allowed or len(candidate) != len(allowed):
+        if not allowed:
             continue
-        if secrets.compare_digest(candidate, allowed):
-            return key
+        try:
+            if secrets.compare_digest(candidate, allowed):
+                return key
+        except TypeError:
+            continue
 
     # Fallback for tests that patch API_AUTH_TOKENS only.
     for allowed in _live_api_auth_tokens():
-        if not allowed or len(candidate) != len(allowed):
+        if not allowed or not isinstance(allowed, str):
             continue
-        if secrets.compare_digest(candidate, allowed):
+        try:
+            matched = secrets.compare_digest(candidate, allowed)
+        except TypeError:
+            continue
+        if matched:
             digest = hashlib.sha256(allowed.encode("utf-8")).hexdigest()[:8]
             return {
                 "id": f"legacy-{digest}",

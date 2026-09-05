@@ -40,6 +40,8 @@ MAX_SCRIPT_ROWS = 256
 MAX_SCRIPT_OUTPUT_CHARS = 20_000
 MAX_OS_MATCHES = 32
 MAX_TRACE_HOPS = 256
+MAX_HOSTS = 5000
+MAX_PORTS_PER_HOST = 1000
 AI_REPORTS_MAX_DIRS = int(os.getenv("AI_REPORTS_MAX_DIRS", "100"))
 AI_REPORTS_MAX_AGE_DAYS = int(os.getenv("AI_REPORTS_MAX_AGE_DAYS", "0"))
 
@@ -67,7 +69,7 @@ def reject_suspicious_target(target: str) -> None:
 
 def run_command(args: list, timeout: int = 10) -> dict:
     try:
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 - argv-only, shell=False
             args,
             capture_output=True,
             check=False,
@@ -139,8 +141,11 @@ def parse_nmap_xml(xml_path: Path) -> dict:
     if root.tag != "nmaprun":
         raise ValueError(f"Expected <nmaprun> root, found <{root.tag}>")
     hosts = []
+    host_nodes = root.findall("host")
+    if len(host_nodes) > MAX_HOSTS:
+        raise ValueError(f"Nmap XML hosts exceeds safety limit ({MAX_HOSTS})")
 
-    for host_node in root.findall("host"):
+    for host_node in host_nodes:
         status_node = host_node.find("status")
         addresses = [
             {
@@ -156,7 +161,9 @@ def parse_nmap_xml(xml_path: Path) -> dict:
         ]
         ports = []
 
-        for port_node in host_node.findall("./ports/port"):
+        for idx, port_node in enumerate(host_node.findall("./ports/port")):
+            if idx >= MAX_PORTS_PER_HOST:
+                break
             try:
                 port_number = int(port_node.attrib.get("portid", "0"))
             except (TypeError, ValueError):
@@ -503,7 +510,10 @@ def create_artifacts(xml_path: Path, out_dir: Path, manifest_extra: dict = None)
         },
     }
     if manifest_extra:
-        manifest.update(manifest_extra)
+        for key, value in manifest_extra.items():
+            if key in ("schema", "artifacts", "stats", "generated_at"):
+                continue
+            manifest[key] = value
 
     write_json(manifest_path, manifest)
     return manifest
@@ -542,7 +552,7 @@ def run_scan(args: argparse.Namespace) -> int:
     command.extend(["-oX", str(xml_path), "-oN", str(normal_path), args.target])
 
     try:
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 - argv-only, shell=False
             command,
             check=False,
             timeout=args.scan_timeout,

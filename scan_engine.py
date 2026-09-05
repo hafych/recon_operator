@@ -14,9 +14,9 @@ import signal
 import subprocess
 import tempfile
 import threading
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
 
 from kali_ai_scan import parse_nmap_xml
 
@@ -24,12 +24,12 @@ PRODUCT_NAME = "Recon Operator"
 SCHEMA_VERSION = "recon-operator-result/v1"
 
 # Active child processes keyed by optional token (usually job_id) for hard cancel.
-_ACTIVE_PROCS: Dict[str, subprocess.Popen] = {}
-_PROCESS_CANCEL_EVENTS: Dict[str, threading.Event] = {}
+_ACTIVE_PROCS: dict[str, subprocess.Popen] = {}
+_PROCESS_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _PROC_LOCK = threading.Lock()
 
 # API scan type names → Nmap argv fragments (multi-profile, not Nmap-only product).
-SCAN_TYPE_ARGS: Dict[str, List[str]] = {
+SCAN_TYPE_ARGS: dict[str, list[str]] = {
     "SYN": ["-sS"],
     "TCP": ["-sT"],
     "UDP": ["-sU"],
@@ -43,7 +43,7 @@ SCAN_TYPE_ARGS: Dict[str, List[str]] = {
 }
 
 # Hybrid profiles: fast port discovery, then Nmap service detection on found ports.
-HYBRID_SCAN_TYPES: Dict[str, str] = {
+HYBRID_SCAN_TYPES: dict[str, str] = {
     "Hybrid": "auto",
     "HybridNaabu": "naabu",
     "HybridRustScan": "rustscan",
@@ -51,8 +51,8 @@ HYBRID_SCAN_TYPES: Dict[str, str] = {
 DISCOVERY_ENGINES = ("auto", "naabu", "rustscan", "none")
 HYBRID_NMAP_PROFILE = "Version"
 
-PORTS_RE = re.compile(r"^[0-9A-Za-z:,\-]{1,200}$")
-SCRIPTS_RE = re.compile(r"^[A-Za-z0-9_.,+\-*/]{1,300}$")
+PORTS_RE = re.compile(r"^[0-9TUtu:,\-]{1,120}$")
+SCRIPTS_RE = re.compile(r"^[A-Za-z0-9_.,+\-]{1,80}$")
 # Engine-side duplicate of the server target check: no whitespace, no shell
 # metacharacters, no leading dash (option injection), bounded length.
 TARGET_RE = re.compile(r"^[A-Za-z0-9._:/,\-\[\]?*]{1,512}$")
@@ -82,7 +82,7 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _register_process(token: Optional[str], proc: subprocess.Popen) -> None:
+def _register_process(token: str | None, proc: subprocess.Popen) -> None:
     if not token:
         return
     with _PROC_LOCK:
@@ -109,7 +109,7 @@ def mark_process_cancelled(token: str) -> None:
         event.set()
 
 
-def process_cancelled(token: Optional[str]) -> bool:
+def process_cancelled(token: str | None) -> bool:
     if not token:
         return False
     with _PROC_LOCK:
@@ -124,7 +124,7 @@ def clear_process_token(token: str) -> None:
         _PROCESS_CANCEL_EVENTS.pop(token, None)
 
 
-def _unregister_process(token: Optional[str], proc: Optional[subprocess.Popen] = None) -> None:
+def _unregister_process(token: str | None, proc: subprocess.Popen | None = None) -> None:
     if not token:
         return
     with _PROC_LOCK:
@@ -135,7 +135,7 @@ def _unregister_process(token: Optional[str], proc: Optional[subprocess.Popen] =
             _ACTIVE_PROCS.pop(token, None)
 
 
-def _process_group_id(proc: subprocess.Popen) -> Optional[int]:
+def _process_group_id(proc: subprocess.Popen) -> int | None:
     """Return the process-group id only while it is still this process's own.
 
     Processes are started with ``start_new_session=True``, making each one a
@@ -210,15 +210,15 @@ def kill_active_process(token: str) -> bool:
 def _run_tracked(
     command: Sequence[str],
     *,
-    timeout: Optional[float],
-    process_token: Optional[str] = None,
+    timeout: float | None,
+    process_token: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run argv command; when ``process_token`` is set, enable process-group cancel.
 
     Without a token, uses ``subprocess.run`` (compatible with existing unit mocks).
     """
     if not process_token:
-        return subprocess.run(
+        return subprocess.run(  # noqa: S603 - argv-only, shell=False
             list(command),
             capture_output=True,
             check=False,
@@ -228,7 +228,7 @@ def _run_tracked(
     if process_cancelled(process_token):
         raise ScanCancelledError("Scan cancelled before process start")
     try:
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # noqa: S603 - argv-only, shell=False
             list(command),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -272,7 +272,7 @@ def supported_scan_types() -> Sequence[str]:
     return tuple(list(SCAN_TYPE_ARGS.keys()) + list(HYBRID_SCAN_TYPES.keys()))
 
 
-def validate_discovery(discovery: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def validate_discovery(discovery: str | None) -> tuple[str | None, str | None]:
     if discovery is None:
         return None, None
     if not isinstance(discovery, str):
@@ -285,7 +285,7 @@ def validate_discovery(discovery: Optional[str]) -> Tuple[Optional[str], Optiona
     return cleaned, None
 
 
-def validate_ports_expression(ports: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def validate_ports_expression(ports: str | None) -> tuple[str | None, str | None]:
     if ports is None:
         return None, None
     if not isinstance(ports, str):
@@ -295,10 +295,17 @@ def validate_ports_expression(ports: Optional[str]) -> Tuple[Optional[str], Opti
         return None, None
     if not PORTS_RE.fullmatch(cleaned):
         return None, "ports has invalid syntax (use Nmap port expressions only)"
+    if (
+        cleaned.startswith(("-", ",", ":"))
+        or cleaned.endswith((",", "-", ":"))
+        or ",," in cleaned
+        or ".." in cleaned
+    ):
+        return None, "ports has invalid syntax (use Nmap port expressions only)"
     return cleaned, None
 
 
-def validate_scripts_expression(scripts: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def validate_scripts_expression(scripts: str | None) -> tuple[str | None, str | None]:
     if scripts is None:
         return None, None
     if not isinstance(scripts, str):
@@ -308,7 +315,11 @@ def validate_scripts_expression(scripts: Optional[str]) -> Tuple[Optional[str], 
         return None, None
     if not SCRIPTS_RE.fullmatch(cleaned):
         return None, "scripts has invalid syntax (NSE names only)"
-    if any(token in cleaned for token in (";", "|", "`", "$", "(", ")", "<", ">", "\n")):
+    if any(
+        token in cleaned for token in (";", "|", "`", "$", "(", ")", "<", ">", "\n", "/", "*", "\\")
+    ):
+        return None, "scripts has invalid syntax (NSE names only)"
+    if cleaned.startswith(("-", ".", ",")) or ".." in cleaned or cleaned.endswith(","):
         return None, "scripts has invalid syntax (NSE names only)"
     return cleaned, None
 
@@ -320,20 +331,43 @@ def build_nmap_command(
     host_timeout_sec: int,
     max_retries: int,
     xml_path: Path,
-    nmap_executable: Optional[str] = None,
-    ports: Optional[str] = None,
-    scripts: Optional[str] = None,
-) -> List[str]:
+    nmap_executable: str | None = None,
+    ports: str | None = None,
+    scripts: str | None = None,
+) -> list[str]:
     if scan_type not in SCAN_TYPE_ARGS:
         raise ValueError(f"Unsupported scan_type: {scan_type}")
     # Defense in depth: re-validate at the engine boundary so no caller can
     # slip option injection or oversized arguments past the scanner.
     if not isinstance(target, str) or not TARGET_RE.fullmatch(target.strip()):
         raise ValueError("target has invalid syntax (host, IP, CIDR, or Nmap range only)")
-    if ports is not None and (not isinstance(ports, str) or not PORTS_RE.fullmatch(ports)):
-        raise ValueError("ports has invalid syntax (Nmap -p expression expected)")
-    if scripts is not None and (not isinstance(scripts, str) or not SCRIPTS_RE.fullmatch(scripts)):
-        raise ValueError("scripts has invalid syntax (NSE names only)")
+    if ports is not None:
+        if not isinstance(ports, str):
+            raise ValueError("ports has invalid syntax (Nmap -p expression expected)")
+        cleaned_ports = ports.strip()
+        if (
+            not PORTS_RE.fullmatch(cleaned_ports)
+            or cleaned_ports.startswith(("-", ",", ":"))
+            or cleaned_ports.endswith((",", "-", ":"))
+            or ",," in cleaned_ports
+            or ".." in cleaned_ports
+        ):
+            raise ValueError("ports has invalid syntax (Nmap -p expression expected)")
+    if scripts is not None:
+        if not isinstance(scripts, str):
+            raise ValueError("scripts has invalid syntax (NSE names only)")
+        cleaned_scripts = scripts.strip()
+        if (
+            not SCRIPTS_RE.fullmatch(cleaned_scripts)
+            or cleaned_scripts.startswith(("-", ".", ","))
+            or cleaned_scripts.endswith(",")
+            or ".." in cleaned_scripts
+            or any(
+                t in cleaned_scripts
+                for t in ("/", "*", "\\", ";", "|", "`", "$", "(", ")", "<", ">", "\n")
+            )
+        ):
+            raise ValueError("scripts has invalid syntax (NSE names only)")
 
     executable = nmap_executable or shutil.which("nmap")
     if not executable:
@@ -356,13 +390,13 @@ def build_nmap_command(
     return command
 
 
-def _normalize_ports(ports: Sequence[int], *, limit: int = 2000) -> List[int]:
+def _normalize_ports(ports: Sequence[int], *, limit: int = 2000) -> list[int]:
     unique = sorted({int(port) for port in ports if 1 <= int(port) <= 65535})
     return unique[:limit]
 
 
-def _parse_naabu_output(stdout: str) -> List[int]:
-    ports: List[int] = []
+def _parse_naabu_output(stdout: str) -> list[int]:
+    ports: list[int] = []
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -388,8 +422,8 @@ def _parse_naabu_output(stdout: str) -> List[int]:
     return _normalize_ports(ports)
 
 
-def _parse_rustscan_output(stdout: str) -> List[int]:
-    ports: List[int] = []
+def _parse_rustscan_output(stdout: str) -> list[int]:
+    ports: list[int] = []
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -420,7 +454,7 @@ def _parse_rustscan_output(stdout: str) -> List[int]:
     return _normalize_ports(ports)
 
 
-def available_discovery_engines() -> Dict[str, Optional[str]]:
+def available_discovery_engines() -> dict[str, str | None]:
     return {
         "naabu": shutil.which("naabu"),
         "rustscan": shutil.which("rustscan"),
@@ -453,16 +487,16 @@ def discover_open_ports(
     target: str,
     *,
     engine: str = "auto",
-    ports_hint: Optional[str] = None,
+    ports_hint: str | None = None,
     timeout_sec: int = 120,
-    process_token: Optional[str] = None,
+    process_token: str | None = None,
 ) -> dict:
     """Run Naabu or RustScan (argv only) and return open TCP ports."""
     resolved = resolve_discovery_engine(engine)
     if resolved == "naabu":
         command = [shutil.which("naabu"), "-host", target, "-silent", "-json"]
-        if ports_hint:
-            command.extend(["-p", ports_hint])
+        if ports_hint and PORTS_RE.fullmatch(ports_hint.strip()):
+            command.extend(["-p", ports_hint.strip()])
         parser = _parse_naabu_output
     else:
         command = [
@@ -473,9 +507,9 @@ def discover_open_ports(
             "--ulimit",
             "5000",
         ]
-        if ports_hint and PORTS_RE.fullmatch(ports_hint):
+        if ports_hint and PORTS_RE.fullmatch(ports_hint.strip()):
             # RustScan -p accepts ranges/lists in many versions.
-            command.extend(["-p", ports_hint])
+            command.extend(["-p", ports_hint.strip()])
         parser = _parse_rustscan_output
 
     try:
@@ -496,6 +530,19 @@ def discover_open_ports(
         detail = (completed.stderr or completed.stdout or "").strip()[:2000]
         suffix = f": {detail}" if detail else ""
         raise DiscoveryError(f"{resolved} exited with status {completed.returncode}{suffix}")
+    if not ports and completed.returncode == 0:
+        stdout_text = (completed.stdout or "").strip()
+        stderr_text = (completed.stderr or "").strip()
+        if stdout_text or stderr_text:
+            lower_out = f"{stdout_text} {stderr_text}".lower()
+            if any(
+                kw in lower_out
+                for kw in ("error", "failed", "permission", "denied", "unable", "cannot", "invalid")
+            ):
+                detail = (stderr_text or stdout_text)[:500]
+                raise DiscoveryError(
+                    f"{resolved} produced no parsable ports but output indicates error: {detail}"
+                )
     return {
         "engine": resolved,
         "command": command,
@@ -510,8 +557,8 @@ def ensure_operator_result(
     *,
     target: str = "",
     scan_type: str = "",
-    ports: Optional[str] = None,
-    scripts: Optional[str] = None,
+    ports: str | None = None,
+    scripts: str | None = None,
 ) -> dict:
     """Normalize either ``ai-nmap-report/v1`` or operator result into operator shape.
 
@@ -555,8 +602,8 @@ def report_to_api_result(
     *,
     target: str = "",
     scan_type: str = "",
-    ports: Optional[str] = None,
-    scripts: Optional[str] = None,
+    ports: str | None = None,
+    scripts: str | None = None,
 ) -> dict:
     """Convert a kali_ai_scan XML report into the dashboard/API host shape."""
     hosts = []
@@ -574,7 +621,7 @@ def report_to_api_result(
 
         hostnames = host.get("hostnames") or []
         hostname = hostnames[0] if hostnames else "N/A"
-        protocols: Dict[str, list] = {}
+        protocols: dict[str, list] = {}
         for port in host.get("ports") or []:
             if not isinstance(port, dict):
                 continue
@@ -616,7 +663,7 @@ def report_to_api_result(
         for port in port_list
         if port.get("state") == "open"
     )
-    service_counts: Dict[str, int] = {}
+    service_counts: dict[str, int] = {}
     for host in hosts:
         for port_list in (host.get("protocols") or {}).values():
             for port in port_list:
@@ -647,15 +694,15 @@ def report_to_api_result(
     }
 
 
-def _open_port_index(result: dict) -> Dict[str, Dict[Tuple[str, int], dict]]:
-    index: Dict[str, Dict[Tuple[str, int], dict]] = {}
+def _open_port_index(result: dict) -> dict[str, dict[tuple[str, int], dict]]:
+    index: dict[str, dict[tuple[str, int], dict]] = {}
     for host in result.get("hosts") or []:
         if not isinstance(host, dict):
             continue
         host_id = str(host.get("host") or "")
         if not host_id:
             continue
-        port_map: Dict[Tuple[str, int], dict] = {}
+        port_map: dict[tuple[str, int], dict] = {}
         for protocol, ports in (host.get("protocols") or {}).items():
             if not isinstance(ports, list):
                 continue
@@ -763,7 +810,7 @@ def _empty_discovery_result(
     scan_type: str,
     *,
     discovery: dict,
-    scripts: Optional[str] = None,
+    scripts: str | None = None,
 ) -> dict:
     result = report_to_api_result(
         {
@@ -787,11 +834,11 @@ def run_nmap_scan(
     host_timeout_sec: int = 300,
     max_retries: int = 2,
     scan_timeout_sec: int = 1800,
-    nmap_executable: Optional[str] = None,
-    ports: Optional[str] = None,
-    scripts: Optional[str] = None,
-    discovery: Optional[str] = None,
-    process_token: Optional[str] = None,
+    nmap_executable: str | None = None,
+    ports: str | None = None,
+    scripts: str | None = None,
+    discovery: str | None = None,
+    process_token: str | None = None,
 ) -> dict:
     """Run recon scan: optional hybrid discovery + Nmap service/port scan.
 
@@ -805,11 +852,15 @@ def run_nmap_scan(
 
     hybrid_engine = HYBRID_SCAN_TYPES.get(scan_type)
     discovery_mode = discovery
+    discovery_budget = None
     if hybrid_engine:
-        discovery_mode = hybrid_engine
+        if discovery == "none":
+            discovery_mode = "none"
+        elif discovery is None:
+            discovery_mode = hybrid_engine
         nmap_type = HYBRID_NMAP_PROFILE
     if discovery_mode and discovery_mode != "none":
-        discovery_budget = max(30, min(300, scan_timeout_sec // 2))
+        discovery_budget = max(30, min(300, scan_timeout_sec // 3))
         discovery_meta = discover_open_ports(
             target,
             engine=discovery_mode,
@@ -847,8 +898,8 @@ def run_nmap_scan(
             scripts=scripts,
         )
         nmap_timeout = scan_timeout_sec
-        if discovery_meta is not None:
-            nmap_timeout = max(60, scan_timeout_sec - 5)
+        if discovery_meta is not None and discovery_budget is not None:
+            nmap_timeout = max(60, scan_timeout_sec - discovery_budget - 5)
         try:
             completed = _run_tracked(
                 command,
@@ -911,6 +962,11 @@ def import_nmap_xml(
     scan_type: str = "Import",
 ) -> dict:
     """Parse untrusted Nmap XML bytes into an API result (size-limited by caller)."""
+    # Enforce size before touching disk (caller also checks, defense in depth)
+    from kali_ai_scan import MAX_XML_BYTES
+
+    if len(xml_bytes) > MAX_XML_BYTES:
+        raise ValueError(f"Nmap XML exceeds the {MAX_XML_BYTES // (1024 * 1024)} MiB safety limit")
     temporary_directory = tempfile.mkdtemp(prefix="recon-operator-import-")
     xml_path = Path(temporary_directory) / "import.xml"
     try:

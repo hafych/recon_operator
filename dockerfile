@@ -12,14 +12,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SCAN_LOG_PATH=/app/logs/scan_log.txt \
     UMASK=077
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y nmap \
+    && apt-get install --no-install-recommends -y nmap=7.93+dfsg1-1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 app
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN python -m pip install -r requirements.txt
+COPY requirements-hashed.txt ./
+RUN python -m pip install --upgrade pip \
+    && python -m pip install --require-hashes -r requirements-hashed.txt
 
 COPY --chown=app:app . .
 RUN mkdir -p encrypted_results logs data \
@@ -34,4 +35,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/live', timeout=3)"]
 
 STOPSIGNAL SIGTERM
-CMD ["python", "autonmap.py"]
+CMD ["python", "-m", "recon_operator"]

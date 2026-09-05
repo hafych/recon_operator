@@ -389,9 +389,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["status"], "healthy")
         self.assertIn("jobs_count", payload)
-        self.assertIn("fernet_key_count", payload)
-        self.assertGreaterEqual(payload["fernet_key_count"], 1)
-        self.assertEqual(payload["api_auth_header"], autonmap.API_AUTH_HEADER)
+        self.assertIn("legacy_results_shared", payload)
         self.assertEqual(payload["api_auth_required"], autonmap.API_AUTH_REQUIRED)
 
     async def test_audit_requires_admin_and_lists_events(self):
@@ -633,6 +631,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             "result": sample,
             "result_file": filename,
             "kind": "immediate",
+            "owner_id": autonmap.owner_id_from_token("test-token"),
             "task": None,
         }
         job_response = await self.client.get("/jobs/job-x", headers={"X-API-KEY": "test-token"})
@@ -775,6 +774,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             "result": None,
             "result_file": None,
             "kind": "immediate",
+            "owner_id": autonmap.owner_id_from_token("test-token"),
             "task": None,
         }
         response = await self.client.delete("/jobs/job-cancel", headers={"X-API-KEY": "test-token"})
@@ -1641,9 +1641,21 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error, "interval must be a number")
 
     def test_job_and_owner_helpers(self):
-        self.assertTrue(autonmap.job_visible_to_owner({"owner_id": None}, "abc"))
+        # Legacy visibility depends on LEGACY_JOBS_SHARED flag
+        original_legacy = autonmap.LEGACY_JOBS_SHARED
+        autonmap.LEGACY_JOBS_SHARED = True
+        try:
+            self.assertTrue(autonmap.job_visible_to_owner({"owner_id": None}, "abc"))
+        finally:
+            autonmap.LEGACY_JOBS_SHARED = original_legacy
         self.assertTrue(autonmap.job_visible_to_owner({"owner_id": "owner-a"}, "owner-a"))
         self.assertFalse(autonmap.job_visible_to_owner({"owner_id": "owner-a"}, "owner-b"))
+        # With secure default False, legacy should be hidden
+        autonmap.LEGACY_JOBS_SHARED = False
+        try:
+            self.assertFalse(autonmap.job_visible_to_owner({"owner_id": None}, "abc"))
+        finally:
+            autonmap.LEGACY_JOBS_SHARED = original_legacy
         task_id = autonmap.make_task_id("127.0.0.1", "Ping", "deadbeefcafe01")
         self.assertTrue(task_id.startswith("odeadbeefcafe-"))
         self.assertEqual(autonmap.owner_result_prefix("deadbeefcafe01"), "odeadbeefcafe_")
@@ -2304,9 +2316,11 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
             autonmap.bot = original_bot
             autonmap.CHAT_ID = original_chat
 
+        autonmap._NMAP_CACHE["ts"] = 0
         with mock.patch("autonmap.shutil.which", return_value=None):
             self.assertFalse(autonmap._check_nmap_available())
 
+        autonmap._NMAP_CACHE["ts"] = 0
         with (
             mock.patch("autonmap.shutil.which", return_value="/usr/bin/nmap"),
             mock.patch(
@@ -2315,6 +2329,7 @@ class ReleaseDCoverageTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             self.assertFalse(autonmap._check_nmap_available())
+        autonmap._NMAP_CACHE["ts"] = 0
 
     async def test_safe_result_path_rejects_bad_names(self):
         self.assertIsNone(autonmap._safe_result_path("../etc/passwd"))

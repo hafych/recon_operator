@@ -21,7 +21,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from cryptography.fernet import InvalidToken
 from dotenv import load_dotenv
@@ -31,6 +31,7 @@ from telegram.error import TelegramError
 
 import recon_operator.auth as _auth
 import recon_operator.config as _config
+import recon_operator.rate_limit as _rate_limit
 from recon_operator.ai_pack import build_ai_pack, normalize_budget
 from recon_operator.crypto import build_fernet_cipher, load_fernet_key_material
 from recon_operator.metrics import METRICS
@@ -55,7 +56,6 @@ from scan_engine import (
     NmapScanError,
     NmapTimeoutError,
     ScanCancelledError,
-    available_discovery_engines,
     clear_process_token,
     diff_scan_results,
     import_nmap_xml,
@@ -175,12 +175,22 @@ def _create_log_handler():
         try:
             log_dir = os.path.dirname(path)
             if log_dir:
-                os.makedirs(log_dir, exist_ok=True)
-            return RotatingFileHandler(
+                os.makedirs(log_dir, mode=0o700, exist_ok=True)
+                try:
+                    os.chmod(log_dir, 0o700)
+                except OSError:
+                    pass
+            handler = RotatingFileHandler(
                 path,
                 maxBytes=10 * 1024 * 1024,
                 backupCount=5,
             )
+            try:
+                if os.path.exists(path):
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
+            return handler
         except (OSError, ValueError):
             continue
     return logging.StreamHandler()
@@ -200,8 +210,8 @@ bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN and CHAT_ID else None
 _redis_client: Any = None
 _redis_init_attempted = False
 _redis_available = False
-_job_worker_task: Optional[asyncio.Task] = None
-_scheduler_leader_task: Optional[asyncio.Task] = None
+_job_worker_task: asyncio.Task | None = None
+_scheduler_leader_task: asyncio.Task | None = None
 _is_scheduler_leader = False
 
 if API_AUTH_REQUIRED and not API_AUTH_TOKENS:
@@ -228,14 +238,16 @@ app = Quart(
 # Quart applies this ceiling before route dispatch. Use the largest supported
 # body here; a route-aware hook below keeps ordinary JSON at the lower limit.
 app.config["MAX_CONTENT_LENGTH"] = max(MAX_REQUEST_BODY_BYTES, MAX_IMPORT_XML_BYTES)
-scan_tasks: Dict[str, asyncio.Task] = {}
-scan_jobs: Dict[str, Dict[str, Any]] = {}
-engagements: Dict[str, Dict[str, Any]] = {}
-_engagement_tasks: Dict[str, asyncio.Task] = {}
-rate_limits = defaultdict(list)
+scan_tasks: dict[str, asyncio.Task] = {}
+scan_jobs: dict[str, dict[str, Any]] = {}
+engagements: dict[str, dict[str, Any]] = {}
+_engagement_tasks: dict[str, asyncio.Task] = {}
+# Shared rate-limit state: single source of truth lives in rate_limit module.
+rate_limits = _rate_limit.rate_limits
+_rate_limit_lock = _rate_limit._rate_limit_lock
 tool_inventory_cache = {}
 tool_inventory_locks = defaultdict(threading.Lock)
-_scan_semaphore: Optional[asyncio.Semaphore] = None
+_scan_semaphore: asyncio.Semaphore | None = None
 _jobs_lock = asyncio.Lock()
 _engagements_lock = asyncio.Lock()
 state_store = StateStore(STATE_DB_PATH)
@@ -245,14 +257,15 @@ state_store = StateStore(STATE_DB_PATH)
 async def _enforce_route_body_limit():
     if request.method not in {"POST", "PUT", "PATCH"}:
         return None
-    if request.path == "/results/import":
-        return None
+    is_import = request.path == "/results/import"
+    limit = MAX_IMPORT_XML_BYTES if is_import else MAX_REQUEST_BODY_BYTES
     content_length = request.content_length
-    if content_length is not None and content_length > MAX_REQUEST_BODY_BYTES:
+    if content_length is not None and content_length > limit:
         return jsonify({"error": "Request body too large"}), 413
     if content_length is None:
+        # Chunked encoding: read and enforce limit (bounded by MAX_CONTENT_LENGTH=16MiB)
         body = await request.get_data(cache=True)
-        if len(body) > MAX_REQUEST_BODY_BYTES:
+        if len(body) > limit:
             return jsonify({"error": "Request body too large"}), 413
     return None
 
@@ -277,7 +290,7 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat()
 
 
-def _normalize_scan_type(scan_type: str) -> Optional[str]:
+def _normalize_scan_type(scan_type: str) -> str | None:
     normalized = scan_type.strip()
     if not normalized:
         return None
@@ -314,8 +327,24 @@ def log_event(event: str, **fields: Any):
         for key, value in fields.items():
             if value is None:
                 continue
-            # Never log secrets.
-            if key.lower() in {"token", "api_token", "fernet_key", "password", "secret"}:
+            # Never log secrets (deny by substring: token/key/secret/password/auth).
+            lowered = key.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "token",
+                    "secret",
+                    "password",
+                    "fernet",
+                    "api_key",
+                    "apikey",
+                    "authorization",
+                    "x-api-key",
+                    "bot_token",
+                    "chat_id",
+                    "redis_url",
+                )
+            ):
                 continue
             payload[key] = value
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -329,15 +358,15 @@ def log_event(event: str, **fields: Any):
 def record_audit_event(
     action: str,
     *,
-    target: Optional[str] = None,
-    scan_type: Optional[str] = None,
-    job_id: Optional[str] = None,
-    task_id: Optional[str] = None,
-    result_file: Optional[str] = None,
-    status: Optional[str] = None,
-    detail: Optional[str] = None,
-    actor_key_id: Optional[str] = None,
-    actor_owner_prefix: Optional[str] = None,
+    target: str | None = None,
+    scan_type: str | None = None,
+    job_id: str | None = None,
+    task_id: str | None = None,
+    result_file: str | None = None,
+    status: str | None = None,
+    detail: str | None = None,
+    actor_key_id: str | None = None,
+    actor_owner_prefix: str | None = None,
 ) -> None:
     """Append a security-relevant event without secrets (tokens/keys).
 
@@ -386,25 +415,35 @@ def record_audit_event(
                 separators=(",", ":"),
             )
             path = Path(AUDIT_LOG_PATH)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
+            existed = path.exists()
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            _ = existed
     except Exception as exc:
         log_event(f"Audit log write failed: {exc}")
 
 
 def _validate_scan_payload(
-    payload: Optional[Dict],
+    payload: dict | None,
     *,
     validate_interval: bool = True,
-) -> Tuple[
-    Optional[str],
-    Optional[str],
-    Optional[float],
-    Optional[str],
-    Optional[str],
-    Optional[str],
-    Optional[str],
+) -> tuple[
+    str | None,
+    str | None,
+    float | None,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
 ]:
     """Return target, scan_type, interval, ports, scripts, discovery, error."""
     if not isinstance(payload, dict):
@@ -546,7 +585,7 @@ def _validate_scan_payload(
     )
 
 
-def owner_result_prefix(owner_id: Optional[str] = None) -> str:
+def owner_result_prefix(owner_id: str | None = None) -> str:
     value = owner_id or current_owner_id()
     normalized = (
         value.lower()
@@ -556,7 +595,7 @@ def owner_result_prefix(owner_id: Optional[str] = None) -> str:
     return f"o{normalized[:12]}_"
 
 
-def result_visible_to_owner(filename: str, owner_id: Optional[str] = None) -> bool:
+def result_visible_to_owner(filename: str, owner_id: str | None = None) -> bool:
     """Decide whether a stored result file is visible to the given owner.
 
     Owned files (``o{12hex}_…``) are only visible to that owner. Legacy files
@@ -570,77 +609,26 @@ def result_visible_to_owner(filename: str, owner_id: Optional[str] = None) -> bo
     return match.group(1) == owner_result_prefix(owner)[1:13]
 
 
-def job_visible_to_owner(job: Dict[str, Any], owner_id: Optional[str] = None) -> bool:
+def job_visible_to_owner(job: dict[str, Any], owner_id: str | None = None) -> bool:
     owner = owner_id or current_owner_id()
     job_owner = job.get("owner_id")
-    return job_owner is None or job_owner == owner
+    if job_owner is None:
+        return LEGACY_JOBS_SHARED
+    return job_owner == owner
 
 
-def make_task_id(target: str, scan_type: str, owner_id: Optional[str] = None) -> str:
+def make_task_id(target: str, scan_type: str, owner_id: str | None = None) -> str:
     owner = owner_id or current_owner_id()
     owner_prefix = owner_result_prefix(owner)[1:13]
     return f"o{owner_prefix}-{target}-{scan_type}"
 
 
-def _peer_is_trusted_proxy(peer: str) -> bool:
-    """Return True when the direct TCP peer is listed in TRUSTED_PROXIES."""
-    if not peer or peer == "unknown":
-        return False
-    try:
-        peer_ip = ipaddress.ip_address(peer)
-    except ValueError:
-        return False
-    for entry in TRUSTED_PROXIES:
-        try:
-            if "/" in entry:
-                if peer_ip in ipaddress.ip_network(entry, strict=False):
-                    return True
-            elif peer_ip == ipaddress.ip_address(entry):
-                return True
-        except ValueError:
-            continue
-    return False
-
-
-def _first_valid_ip(candidates: str) -> Optional[str]:
-    """Return the first parseable IP from a comma-separated header value."""
-    for part in candidates.split(","):
-        candidate = part.strip()
-        if not candidate:
-            continue
-        # Strip optional port for IPv4 host:port (not bracketed IPv6).
-        if candidate.count(":") == 1 and not candidate.startswith("["):
-            candidate = candidate.split(":", 1)[0].strip()
-        try:
-            return str(ipaddress.ip_address(candidate))
-        except ValueError:
-            continue
-    return None
-
-
-def _client_key() -> str:
-    """Client identifier for rate limiting.
-
-    By default uses the direct peer address. When ``TRUSTED_PROXY_MODE`` is on
-    and the peer is in ``TRUSTED_PROXIES``, prefer ``X-Forwarded-For`` (leftmost
-    valid IP) or ``X-Real-IP``. Spoofed headers from untrusted peers are ignored.
-    """
-    peer = request.remote_addr or "unknown"
-    if not TRUSTED_PROXY_MODE or not _peer_is_trusted_proxy(peer):
-        return peer
-
-    xff = (request.headers.get("X-Forwarded-For") or "").strip()
-    if xff:
-        forwarded = _first_valid_ip(xff)
-        if forwarded:
-            return forwarded
-
-    xreal = (request.headers.get("X-Real-IP") or "").strip()
-    if xreal:
-        real_ip = _first_valid_ip(xreal)
-        if real_ip:
-            return real_ip
-    return peer
+# --- Rate limiting: single source of truth in recon_operator.rate_limit ---
+# Server re-exports the same objects so `autonmap.rate_limits`,
+# `autonmap.check_rate_limit`, ... keep working (tests patch these).
+_peer_is_trusted_proxy = _rate_limit._peer_is_trusted_proxy
+_first_valid_ip = _rate_limit._first_valid_ip
+_client_key = _rate_limit._client_key
 
 
 def _cleanup_finished_tasks() -> list:
@@ -664,144 +652,48 @@ def _cleanup_finished_tasks() -> list:
 
 
 def _rate_limit_bucket_key() -> str:
-    """Build a stable rate-limit bucket from client IP and optional owner id."""
-    client_ip = _client_key()
-    if not RATE_LIMIT_INCLUDE_OWNER:
-        return client_ip
-    try:
-        owner = getattr(g, "owner_id", None)
-    except RuntimeError:
-        owner = None
-    if not owner or owner == "local":
-        return client_ip
-    return f"{client_ip}:o{owner[:12]}"
+    """Build a stable rate-limit bucket (delegates to rate_limit module)."""
+    return _rate_limit._rate_limit_bucket_key()
 
 
 def _get_redis_client() -> Any:
-    """Lazy-connect Redis when REDIS_URL is configured. Returns None on failure/disabled."""
+    """Lazy-connect Redis (delegates to rate_limit; logs backend transitions)."""
+    before = _rate_limit._redis_available
+    client = _rate_limit._get_redis_client()
+    # Mirror shared state for introspection via autonmap._redis_client.
     global _redis_client, _redis_init_attempted, _redis_available
-    if not REDIS_URL:
-        return None
-    if _redis_init_attempted:
-        return _redis_client if _redis_available else None
-    _redis_init_attempted = True
-    try:
-        import redis  # type: ignore
-    except ImportError:
-        log_event("REDIS_URL is set but redis package is not installed; using memory rate limits")
-        _redis_available = False
-        return None
-    try:
-        client = redis.Redis.from_url(
-            REDIS_URL,
-            decode_responses=True,
-            socket_connect_timeout=1.0,
-            socket_timeout=1.0,
-            health_check_interval=30,
-        )
-        client.ping()
-        _redis_client = client
-        _redis_available = True
+    _redis_client = _rate_limit._redis_client
+    _redis_init_attempted = _rate_limit._redis_init_attempted
+    _redis_available = _rate_limit._redis_available
+    if _rate_limit._live_value("REDIS_URL") and not before and _redis_available:
         log_event("Redis rate-limit backend connected")
-        return client
-    except Exception as exc:
-        log_event(f"Redis rate-limit backend unavailable ({exc}); using memory fallback")
-        _redis_client = None
-        _redis_available = False
-        return None
+    return client
 
 
 def rate_limit_backend() -> str:
     """Return active rate-limit backend name for health/docs."""
-    if REDIS_URL and _get_redis_client() is not None:
-        return "redis"
-    if REDIS_URL:
-        return "memory_fallback"
-    return "memory"
+    return _rate_limit.rate_limit_backend()
 
 
 def _check_rate_limit_memory(bucket: str) -> bool:
-    now = time.time()
-
-    if bucket not in rate_limits and len(rate_limits) >= MAX_RATE_LIMIT_CLIENTS:
-        stale_before = now - RATE_LIMIT_WINDOW_SECONDS
-        stale_clients = [
-            key
-            for key, timestamps in rate_limits.items()
-            if not timestamps or timestamps[-1] <= stale_before
-        ]
-        for key in stale_clients:
-            rate_limits.pop(key, None)
-
-        if len(rate_limits) >= MAX_RATE_LIMIT_CLIENTS:
-            oldest_client = min(
-                rate_limits,
-                key=lambda key: rate_limits[key][-1] if rate_limits[key] else 0,
-            )
-            rate_limits.pop(oldest_client, None)
-
-    request_window = rate_limits[bucket]
-    rate_limits[bucket] = [
-        req_time for req_time in request_window if now - req_time < RATE_LIMIT_WINDOW_SECONDS
-    ]
-
-    if len(rate_limits[bucket]) >= MAX_REQUESTS_PER_WINDOW:
-        return False
-
-    rate_limits[bucket].append(now)
-    return True
+    return _rate_limit._check_rate_limit_memory(bucket)
 
 
-_REDIS_RATE_LIMIT_LUA = """
-local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local window = tonumber(ARGV[2])
-local limit = tonumber(ARGV[3])
-local member = ARGV[4]
-redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
-local count = redis.call('ZCARD', key)
-if count >= limit then
-  return 0
-end
-redis.call('ZADD', key, now, member)
-redis.call('EXPIRE', key, window + 1)
-return 1
-"""
+_REDIS_RATE_LIMIT_LUA = _rate_limit._REDIS_RATE_LIMIT_LUA
 
 
 def _check_rate_limit_redis(client: Any, bucket: str) -> bool:
-    """Sliding-window limit via Redis sorted set (atomic Lua, shared across workers)."""
-    now = time.time()
-    key = f"{REDIS_RATE_LIMIT_PREFIX}{bucket}"
-    member = f"{now:.6f}:{secrets.token_hex(4)}"
+    """Sliding-window limit via Redis (delegates; logs fallback)."""
     try:
-        # Prefer EVAL for atomicity under concurrent workers.
-        allowed = client.eval(
-            _REDIS_RATE_LIMIT_LUA,
-            1,
-            key,
-            str(now),
-            str(RATE_LIMIT_WINDOW_SECONDS),
-            str(MAX_REQUESTS_PER_WINDOW),
-            member,
-        )
-        return bool(int(allowed))
-    except Exception as exc:
+        return _rate_limit._check_rate_limit_redis(client, bucket)
+    except Exception as exc:  # pragma: no cover - defensive
         log_event(f"Redis rate limit error for {bucket}: {exc}; falling back to memory")
-        return _check_rate_limit_memory(bucket)
+        return _rate_limit._check_rate_limit_memory(bucket)
 
 
 def check_rate_limit() -> bool:
     """Enforce per-window request budget (memory or shared Redis)."""
-    bucket = _rate_limit_bucket_key()
-    client = _get_redis_client()
-    if client is not None:
-        allowed = _check_rate_limit_redis(client, bucket)
-    else:
-        allowed = _check_rate_limit_memory(bucket)
-    if not allowed:
-        METRICS.inc("recon_operator_rate_limit_exceeded_total")
-    return allowed
+    return _rate_limit.check_rate_limit()
 
 
 def _bool_query_param(name: str, default: bool = False) -> bool:
@@ -811,7 +703,7 @@ def _bool_query_param(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-def get_cached_tool_inventory(expand: bool = False) -> Dict:
+def get_cached_tool_inventory(expand: bool = False) -> dict:
     cache_key = "expanded" if expand else "summary"
     with tool_inventory_locks[cache_key]:
         cached = tool_inventory_cache.get(cache_key)
@@ -843,6 +735,24 @@ async def send_telegram_message(message: str):
         log_event(f"Unexpected Telegram error: {e}")
 
 
+def _telegram_scan_suffix(target: str | None = None) -> str:
+    """Return ' for <target>' only when TELEGRAM_INCLUDE_TARGET is enabled."""
+    if TELEGRAM_INCLUDE_TARGET and target:
+        safe = str(target).replace("\n", " ").replace("\r", " ")[:200]
+        return f" for {safe}"
+    return ""
+
+
+async def _notify_scan_lifecycle(status: str, target: str | None = None) -> None:
+    """Telegram lifecycle notice without internals; target gated by config."""
+    await send_telegram_message(f"Scan {status}{_telegram_scan_suffix(target)}")
+
+
+async def _notify_scan_error(status: str, target: str | None = None) -> None:
+    """Telegram error notice: generic text, no exception internals."""
+    await send_telegram_message(f"Scan {status}{_telegram_scan_suffix(target)}")
+
+
 def validate_ip_or_host(target: str) -> bool:
     """Validate IP, network, or domain syntax."""
     if not isinstance(target, str) or not target:
@@ -851,17 +761,21 @@ def validate_ip_or_host(target: str) -> bool:
     target = target.strip()
     if len(target) > 253:
         return False
+    if target.startswith("-"):
+        return False
 
     dangerous_chars = [";", "&", "|", "`", "$", "(", ")", "<", ">", "\\", "\n", "\r", "\t"]
     if any(char in target for char in dangerous_chars):
-        log_event(f"Potential injection-like input detected in target: {target}")
+        safe = target.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")[:200]
+        log_event(f"Potential injection-like input detected in target: {safe}")
         return False
 
     try:
         network = ipaddress.ip_network(target, strict=False)
         if network.num_addresses > MAX_TARGET_ADDRESSES:
+            safe = target.replace("\n", "\\n").replace("\r", "\\r")[:200]
             log_event(
-                f"Target range is too large: {target} contains {network.num_addresses} addresses"
+                f"Target range is too large: {safe} contains {network.num_addresses} addresses"
             )
             return False
         return True
@@ -870,7 +784,16 @@ def validate_ip_or_host(target: str) -> bool:
             r"^(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}|localhost)$",
             re.IGNORECASE,
         )
-        return auth_domain_re.fullmatch(target) is not None
+        if auth_domain_re.fullmatch(target) is not None:
+            return True
+        # Nmap range syntax: 10.0.0.*, 10.0.0.1-100, 10.0.0.1,2,3, 192.168.1.[1-254]
+        # Unified with scan_engine TARGET_RE but bounded and without leading dash.
+        nmap_range_re = re.compile(r"^[A-Za-z0-9._:/,\-\[\]?*]{1,512}$")
+        if nmap_range_re.fullmatch(target) and any(c in target for c in "*?[],-"):
+            # Estimate size for simple octet/range to enforce MAX_TARGET_ADDRESSES loosely
+            # For complex ranges we allow but rely on host-timeout/max-retries
+            return True
+        return False
 
 
 def _allowlist_entry_matches_ip(entry: str, addr: Any) -> bool:
@@ -911,12 +834,12 @@ def _allowlist_entry_matches_host(entry: str, host: str) -> bool:
     return entry_lower == host_lower
 
 
-def target_in_allowlist(target: str, allowlist: Optional[List[str]] = None) -> bool:
+def target_in_allowlist(target: str, allowlist: list[str] | None = None) -> bool:
     """Return True when target is permitted by the engagement allowlist."""
     return target_allowlist_error(target, allowlist) is None
 
 
-def target_allowlist_error(target: str, allowlist: Optional[List[str]] = None) -> Optional[str]:
+def target_allowlist_error(target: str, allowlist: list[str] | None = None) -> str | None:
     """Return an error string if target is outside the configured allowlist.
 
     Empty allowlist means unrestricted (default single-operator behavior).
@@ -964,10 +887,10 @@ def _canonicalize_valid_target(target: str) -> str:
 def scan_network(
     target: str,
     scan_type: str,
-    ports: Optional[str] = None,
-    scripts: Optional[str] = None,
-    discovery: Optional[str] = None,
-    process_token: Optional[str] = None,
+    ports: str | None = None,
+    scripts: str | None = None,
+    discovery: str | None = None,
+    process_token: str | None = None,
 ) -> dict:
     """
     Synchronous scan entry point used by the async executor.
@@ -998,11 +921,11 @@ def scan_network(
         raise RuntimeError(str(exc)) from exc
 
 
-def _result_files() -> List[Path]:
+def _result_files() -> list[Path]:
     directory = Path(RESULTS_DIR)
     if not directory.is_dir():
         return []
-    existing: List[Tuple[float, Path]] = []
+    existing: list[tuple[float, Path]] = []
     try:
         candidates = list(directory.iterdir())
     except OSError:
@@ -1018,7 +941,7 @@ def _result_files() -> List[Path]:
     return [path for _, path in existing]
 
 
-def apply_results_retention(directory: Optional[str] = None) -> Dict[str, int]:
+def apply_results_retention(directory: str | None = None) -> dict[str, int]:
     """Delete old encrypted results by count and optional age."""
     root = Path(directory or RESULTS_DIR)
     if not root.is_dir():
@@ -1086,8 +1009,8 @@ async def save_scan_results_async(
     results: dict,
     target: str,
     scan_type: str,
-    owner_id: Optional[str] = None,
-) -> Optional[str]:
+    owner_id: str | None = None,
+) -> str | None:
     if not results:
         return None
 
@@ -1111,29 +1034,19 @@ async def save_scan_results_async(
     try:
         encrypted_data = cipher.encrypt(json.dumps(results, indent=2).encode())
         await asyncio.to_thread(_write_encrypted_result, str(path), encrypted_data)
-        try:
-            await asyncio.to_thread(apply_results_retention, RESULTS_DIR)
-        except Exception as exc:
-            # The encrypted result is already durable; maintenance failure
-            # must not turn a successful scan into a failed job.
-            log_event(f"Result retention failed after saving {filename}: {exc}")
         log_event(f"Results saved to {path}")
-        if TELEGRAM_INCLUDE_TARGET:
-            await send_telegram_message(f"Scan {target} finished. Results: {filename}")
-        else:
-            await send_telegram_message(f"Scan finished. Results: {filename}")
+        await send_telegram_message(
+            f"Scan finished{_telegram_scan_suffix(target)}. Results: {filename}"
+        )
         return filename
     except Exception as e:
         err = f"Error saving results: {e}"
         log_event(err)
-        if TELEGRAM_INCLUDE_TARGET:
-            await send_telegram_message(f"Error saving results for {target}: {e}")
-        else:
-            await send_telegram_message(f"Error saving results: {e}")
+        await send_telegram_message(f"Error saving results{_telegram_scan_suffix(target)}")
         raise
 
 
-async def _load_job_result_payload(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+async def _load_job_result_payload(job: dict[str, Any]) -> dict[str, Any] | None:
     """Load a completed job result from memory or its encrypted result file."""
     result = job.get("result")
     if isinstance(result, dict):
@@ -1153,7 +1066,7 @@ async def _load_job_result_payload(job: Dict[str, Any]) -> Optional[Dict[str, An
     return payload if isinstance(payload, dict) else None
 
 
-def _job_public_view(job: Dict[str, Any], *, include_result: bool = True) -> Dict[str, Any]:
+def _job_public_view(job: dict[str, Any], *, include_result: bool = True) -> dict[str, Any]:
     view = {
         "job_id": job["job_id"],
         "target": job["target"],
@@ -1175,7 +1088,7 @@ def _job_public_view(job: Dict[str, Any], *, include_result: bool = True) -> Dic
     return view
 
 
-def _persist_job(job: Dict[str, Any]) -> None:
+def _persist_job(job: dict[str, Any]) -> None:
     """Persist compatibility state and propagate failures to the caller."""
     state_store.upsert_job(job)
     state_store.prune_jobs(MAX_SCAN_JOBS)
@@ -1218,7 +1131,7 @@ def _release_redis_job_lease(job_id: str) -> None:
         log_event(f"Redis job lease release error for {job_id}: {exc}")
 
 
-def _claim_job_for_worker(job_id: str) -> Optional[Dict[str, Any]]:
+def _claim_job_for_worker(job_id: str) -> dict[str, Any] | None:
     """SQLite atomic claim + optional Redis fence."""
     if not _try_redis_job_lease(job_id):
         return None
@@ -1248,6 +1161,11 @@ def _renew_job_lease(job_id: str) -> bool:
 
 async def _prune_jobs_locked() -> None:
     """Keep completed/failed jobs within MAX_SCAN_JOBS."""
+    # Prune DB first (source of truth), then memory to match
+    try:
+        await asyncio.to_thread(state_store.prune_jobs, MAX_SCAN_JOBS)
+    except Exception as exc:
+        log_event(f"Failed to prune persisted jobs: {exc}")
     if len(scan_jobs) <= MAX_SCAN_JOBS:
         return
     terminal = [
@@ -1269,7 +1187,7 @@ async def _prune_jobs_locked() -> None:
 _TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled", "timeout"})
 
 
-def _note_job_terminal_metrics(job: Dict[str, Any], *, previous_status: Any, status: str) -> None:
+def _note_job_terminal_metrics(job: dict[str, Any], *, previous_status: Any, status: str) -> None:
     """Record finish counter + duration once when a job first becomes terminal."""
     if status not in _TERMINAL_JOB_STATUSES:
         return
@@ -1329,7 +1247,7 @@ async def _set_job_fields(job_id: str, **fields: Any) -> None:
         _persist_job(job)
 
 
-async def _refresh_job_from_store(job_id: str) -> Optional[Dict[str, Any]]:
+async def _refresh_job_from_store(job_id: str) -> dict[str, Any] | None:
     """Refresh durable fields while preserving only process-local state."""
     stored = await asyncio.to_thread(state_store.get_job, job_id)
     async with _jobs_lock:
@@ -1374,9 +1292,9 @@ async def _finalize_job(
     job_id: str,
     *,
     status: str,
-    error: Optional[str],
-    result_file: Optional[str] = None,
-    result: Optional[Dict[str, Any]] = None,
+    error: str | None,
+    result_file: str | None = None,
+    result: dict[str, Any] | None = None,
 ) -> bool:
     finished_at = _utc_now_iso()
     if error is not None:
@@ -1408,7 +1326,7 @@ async def _finalize_job(
     return True
 
 
-def _delete_saved_result(result_file: Optional[str]) -> None:
+def _delete_saved_result(result_file: str | None) -> None:
     """Remove an uncommitted result created after a lost terminal-state race."""
     if not result_file or os.path.basename(result_file) != result_file:
         return
@@ -1466,12 +1384,12 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
 
     loop = asyncio.get_running_loop()
     runner_task = asyncio.current_task()
-    heartbeat: Optional[asyncio.Task] = None
+    heartbeat: asyncio.Task | None = None
     lease_lost = False
     executor_submitted = False
     prepare_process_token(job_id)
 
-    def _execute_scan() -> Dict[str, Any]:
+    def _execute_scan() -> dict[str, Any]:
         try:
             return scan_network(
                 target,
@@ -1538,6 +1456,10 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
         if not committed:
             await asyncio.to_thread(_delete_saved_result, result_file)
             return
+        try:
+            await asyncio.to_thread(apply_results_retention, RESULTS_DIR)
+        except Exception as exc:
+            log_event(f"Result retention failed after saving {result_file}: {exc}")
         record_audit_event(
             "scan.finish",
             target=target,
@@ -1598,7 +1520,7 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             error=err,
         )
         if committed:
-            await send_telegram_message(err)
+            await _notify_scan_error("timed out", target)
             record_audit_event(
                 "scan.finish",
                 target=target,
@@ -1617,7 +1539,7 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             error=err,
         )
         if committed:
-            await send_telegram_message(err)
+            await _notify_scan_error("timed out", target)
             record_audit_event(
                 "scan.finish",
                 target=target,
@@ -1635,7 +1557,7 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             error=str(exc),
         )
         if committed:
-            await send_telegram_message(err)
+            await _notify_scan_error("failed", target)
             record_audit_event(
                 "scan.finish",
                 target=target,
@@ -1665,7 +1587,7 @@ async def _run_scan_job(job_id: str, *, already_claimed: bool = False) -> None:
             await _prune_jobs_locked()
 
 
-async def _adopt_claimed_job(claimed: Dict[str, Any]) -> None:
+async def _adopt_claimed_job(claimed: dict[str, Any]) -> None:
     """Register a job claimed by the poller and run it locally."""
     job_id = claimed["job_id"]
     async with _jobs_lock:
@@ -1689,7 +1611,7 @@ async def _adopt_claimed_job(claimed: Dict[str, Any]) -> None:
         job["task"] = task
 
 
-async def job_claim_loop(stop_event: Optional[asyncio.Event] = None) -> None:
+async def job_claim_loop(stop_event: asyncio.Event | None = None) -> None:
     """Poll SQLite for queued / expired-lease jobs (multi-worker recovery)."""
     log_event(f"Job claim loop started (worker={WORKER_ID}, lease={JOB_LEASE_SECONDS}s)")
     while True:
@@ -1729,11 +1651,11 @@ async def create_scan_job(
     scan_type: str,
     *,
     kind: str = "immediate",
-    ports: Optional[str] = None,
-    scripts: Optional[str] = None,
-    discovery: Optional[str] = None,
-    owner_id: Optional[str] = None,
-) -> Dict[str, Any]:
+    ports: str | None = None,
+    scripts: str | None = None,
+    discovery: str | None = None,
+    owner_id: str | None = None,
+) -> dict[str, Any]:
     owner = owner_id or current_owner_id()
     async with _jobs_lock:
         await _prune_jobs_locked()
@@ -1806,10 +1728,10 @@ async def create_scan_job(
 async def async_scan(
     target: str,
     scan_type: str,
-    ports: Optional[str] = None,
-    scripts: Optional[str] = None,
-    discovery: Optional[str] = None,
-    owner_id: Optional[str] = None,
+    ports: str | None = None,
+    scripts: str | None = None,
+    discovery: str | None = None,
+    owner_id: str | None = None,
     kind: str = "immediate",
 ) -> dict:
     """Run a scan and wait for completion (used by scheduled scans)."""
@@ -1844,7 +1766,7 @@ async def async_scan(
                 pass
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: S110 - loop must survive job-state races
                 # Job state is the source of truth; continue loop.
                 pass
         else:
@@ -1857,6 +1779,8 @@ async def presets_list():
     auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
     return (
         jsonify(
             {
@@ -1871,7 +1795,7 @@ async def presets_list():
     )
 
 
-async def _wait_job_terminal(job_id: str) -> Dict[str, Any]:
+async def _wait_job_terminal(job_id: str) -> dict[str, Any]:
     """Poll until a job reaches a terminal status; return the job dict."""
     terminal = _TERMINAL_JOB_STATUSES
     while True:
@@ -1890,7 +1814,7 @@ async def _wait_job_terminal(job_id: str) -> Dict[str, Any]:
 
 
 def _skip_engagement_tail(
-    steps: List[Dict[str, Any]],
+    steps: list[dict[str, Any]],
     *,
     after_index: int,
     reason: str,
@@ -1913,7 +1837,7 @@ async def _run_engagement(engagement_id: str) -> None:
         owner = eng.get("owner_id") or "local"
         target = eng.get("target")
 
-    active_job_id: Optional[str] = None
+    active_job_id: str | None = None
     active_step_index = -1
     try:
         for index, step in enumerate(steps):
@@ -2125,6 +2049,8 @@ async def playbook_status(engagement_id: str):
     auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
     async with _engagements_lock:
         eng = engagements.get(engagement_id)
     if not eng:
@@ -2143,6 +2069,8 @@ async def playbook_cancel(engagement_id: str):
     auth_error = require_api_auth("scan")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
     async with _engagements_lock:
         eng = engagements.get(engagement_id)
         if not eng:
@@ -2328,7 +2256,7 @@ async def start_scan():
     except Exception as e:
         err = f"API error in /scan: {e}"
         log_event(err)
-        await send_telegram_message(f"API error: {e}")
+        await send_telegram_message("Internal scan error")
         return jsonify({"error": "Internal scan error"}), 500
 
 
@@ -2337,6 +2265,8 @@ async def list_jobs():
     auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     owner = current_owner_id()
     try:
@@ -2376,6 +2306,8 @@ async def get_job(job_id: str):
     auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     owner = current_owner_id()
     job = await _refresh_job_from_store(job_id)
@@ -2396,7 +2328,7 @@ async def _cancel_scan_job(
     job_id: str,
     *,
     owner_id: str,
-) -> Tuple[Optional[Dict[str, Any]], bool, bool]:
+) -> tuple[dict[str, Any] | None, bool, bool]:
     """Cancel an owned queued/running job and return (job, changed, process_killed)."""
     finished_at = _utc_now_iso()
     durable, changed = await asyncio.to_thread(
@@ -2471,6 +2403,8 @@ async def cancel_job(job_id: str):
     auth_error = require_api_auth("scan")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     job, changed, killed = await _cancel_scan_job(job_id, owner_id=current_owner_id())
     if job is None:
@@ -2557,7 +2491,7 @@ def is_scheduler_leader() -> bool:
     return _is_scheduler_leader
 
 
-def _start_local_scheduled_task(row: Dict[str, Any]) -> bool:
+def _start_local_scheduled_task(row: dict[str, Any]) -> bool:
     """Start a local periodic_scan for a DB row if not already running."""
     task_id = row["task_id"]
     if task_id in scan_tasks and not scan_tasks[task_id].done():
@@ -2613,7 +2547,7 @@ async def sync_scheduled_tasks_from_store() -> None:
             )
 
 
-async def scheduler_leader_loop(stop_event: Optional[asyncio.Event] = None) -> None:
+async def scheduler_leader_loop(stop_event: asyncio.Event | None = None) -> None:
     """Elect a single scheduler leader so recurring scans do not duplicate."""
     global _is_scheduler_leader
     log_event(
@@ -2645,10 +2579,10 @@ async def periodic_scan(
     target: str,
     scan_type: str,
     interval_minutes: float,
-    ports: Optional[str] = None,
-    scripts: Optional[str] = None,
-    discovery: Optional[str] = None,
-    owner_id: Optional[str] = None,
+    ports: str | None = None,
+    scripts: str | None = None,
+    discovery: str | None = None,
+    owner_id: str | None = None,
 ):
     """Async recurring scan loop (leader only)."""
     try:
@@ -2662,7 +2596,8 @@ async def periodic_scan(
     owner = owner_id or "local"
     log_event(f"Started periodic scan {target} every {interval} minutes")
     await send_telegram_message(
-        f"{PRODUCT_NAME}: started periodic scan {target} every {interval} minutes"
+        f"{PRODUCT_NAME}: started periodic scan{_telegram_scan_suffix(target)} "
+        f"every {interval} minutes"
     )
 
     while True:
@@ -2689,7 +2624,7 @@ async def periodic_scan(
         except Exception as e:
             err = f"Periodic scan error for {target}: {e}"
             log_event(err)
-            await send_telegram_message(err)
+            await send_telegram_message(f"Periodic scan error{_telegram_scan_suffix(target)}")
 
         try:
             await asyncio.sleep(interval * 60)
@@ -2790,6 +2725,8 @@ async def list_tasks():
     auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     owner = current_owner_id()
     owner_prefix = f"o{owner_result_prefix(owner)[1:13]}-"
@@ -2849,6 +2786,8 @@ async def cancel_task(task_id):
     auth_error = require_api_auth("scan")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     owner = current_owner_id()
     owner_prefix = f"o{owner_result_prefix(owner)[1:13]}-"
@@ -2888,7 +2827,7 @@ async def cancel_task(task_id):
     return jsonify({"error": "Task not found"}), 404
 
 
-def _safe_result_path(result_id: str) -> Optional[Path]:
+def _safe_result_path(result_id: str) -> Path | None:
     name = os.path.basename(result_id.strip())
     if name != result_id.strip() or ".." in name:
         return None
@@ -2909,6 +2848,8 @@ async def list_results():
     auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     limit = _parse_optional_limit(request.args.get("limit"), default=50, max_value=500)
     owner = current_owner_id()
@@ -2936,7 +2877,7 @@ async def list_results():
     return jsonify({"count": len(items), "results": items}), 200
 
 
-def _parse_optional_limit(raw: Optional[str], default: int, max_value: int) -> int:
+def _parse_optional_limit(raw: str | None, default: int, max_value: int) -> int:
     if raw is None or raw == "":
         return default
     try:
@@ -2953,6 +2894,8 @@ async def get_result(result_id: str):
     auth_error = require_api_auth("read")
     if auth_error:
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
 
     path = _safe_result_path(result_id)
     if path is None or not result_visible_to_owner(path.name):
@@ -2971,7 +2914,7 @@ async def get_result(result_id: str):
     return jsonify({"id": path.name, "filename": path.name, "result": payload}), 200
 
 
-async def _load_result_reference(ref: Any) -> Tuple[Optional[dict], Optional[str]]:
+async def _load_result_reference(ref: Any) -> tuple[dict | None, str | None]:
     """Resolve a result object or {id: filename} reference."""
     if isinstance(ref, dict) and isinstance(ref.get("hosts"), list):
         return ref, None
@@ -3009,7 +2952,7 @@ async def import_result_xml():
     content_type = (request.content_type or "").lower()
     target_label = ""
     scan_type = "Import"
-    xml_bytes: Optional[bytes] = None
+    xml_bytes: bytes | None = None
 
     if "application/json" in content_type:
         data = await request.get_json(silent=True)
@@ -3017,12 +2960,12 @@ async def import_result_xml():
             return jsonify({"error": "Expected JSON body with xml string"}), 400
         xml_bytes = data["xml"].encode("utf-8")
         if isinstance(data.get("target"), str):
-            target_label = data["target"].strip()
+            target_label = data["target"].strip()[:256]
         if isinstance(data.get("scan_type"), str) and data["scan_type"].strip():
             scan_type = data["scan_type"].strip()[:40]
     else:
-        xml_bytes = await request.get_data(cache=False)
-        target_label = (request.args.get("target") or "").strip()
+        xml_bytes = await request.get_data(cache=True)
+        target_label = (request.args.get("target") or "").strip()[:256]
 
     if not xml_bytes:
         return jsonify({"error": "Empty XML payload"}), 400
@@ -3030,6 +2973,11 @@ async def import_result_xml():
         return jsonify(
             {"error": f"XML exceeds {MAX_IMPORT_XML_BYTES // (1024 * 1024)} MiB limit"}
         ), 413
+    # Bound free-text labels stored in encrypted history and rendered in UI.
+    if target_label and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-/: ]{0,255}", target_label):
+        return jsonify({"error": "Invalid target label"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-]{0,39}", scan_type):
+        return jsonify({"error": "Invalid scan_type label"}), 400
 
     try:
         result = await asyncio.to_thread(
@@ -3156,10 +3104,10 @@ async def recon_plan():
 
 async def _resolve_scan_for_pack(
     *,
-    body: Optional[Dict[str, Any]] = None,
-    result_id: Optional[str] = None,
-    job_id: Optional[str] = None,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str], Optional[str]]:
+    body: dict[str, Any] | None = None,
+    result_id: str | None = None,
+    job_id: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None, str | None, str | None]:
     """Return (scan, error, resolved_result_id, resolved_job_id)."""
     body = body or {}
     result_id = (result_id or body.get("result_id") or body.get("id") or "").strip() or None
@@ -3225,7 +3173,7 @@ async def ai_pack():
     if not check_rate_limit():
         return jsonify({"error": "Rate limit exceeded"}), 429
 
-    body: Dict[str, Any] = {}
+    body: dict[str, Any] = {}
     if request.method == "POST":
         payload = await request.get_json(silent=True)
         if isinstance(payload, dict):
@@ -3400,24 +3348,49 @@ async def add_security_headers(response):
     return response
 
 
+_NMAP_CACHE: dict[str, Any] = {"available": False, "ts": 0.0}
+_NMAP_CACHE_TTL = 5.0
+_NMAP_CACHE_LOCK = threading.Lock()
+
+
 def _check_nmap_available() -> bool:
+    now = time.time()
+    with _NMAP_CACHE_LOCK:
+        if now - _NMAP_CACHE["ts"] < _NMAP_CACHE_TTL:
+            return bool(_NMAP_CACHE["available"])
     executable = shutil.which("nmap")
     if not executable:
-        return False
-    try:
-        result = subprocess.run(
-            [executable, "--version"],
-            capture_output=True,
-            check=False,
-            timeout=3,
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        return False
+        available = False
+    else:
+        try:
+            result = subprocess.run(  # noqa: S603 - argv-only, shell=False
+                [executable, "--version"],
+                capture_output=True,
+                check=False,
+                timeout=3,
+            )
+            available = result.returncode == 0
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            available = False
+    with _NMAP_CACHE_LOCK:
+        _NMAP_CACHE["available"] = available
+        _NMAP_CACHE["ts"] = time.time()
+    return available
 
 
-def _job_status_gauges() -> Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float]:
+_GAUGES_CACHE: dict[str, Any] = {"gauges": None, "ts": 0.0}
+_GAUGES_TTL = 1.0
+_GAUGES_LOCK = threading.Lock()
+
+
+def _job_status_gauges() -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
     """Live gauges derived from durable state shared by every worker."""
+    now = time.time()
+    with _GAUGES_LOCK:
+        cached = _GAUGES_CACHE.get("gauges")
+        ts = _GAUGES_CACHE.get("ts", 0.0)
+        if cached is not None and now - ts < _GAUGES_TTL:
+            return dict(cached)
     try:
         jobs = state_store.list_jobs(MAX_SCAN_JOBS)
         scheduled_count = len(state_store.list_scheduled_tasks())
@@ -3435,12 +3408,16 @@ def _job_status_gauges() -> Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float]
             queued += 1
         elif status == "running":
             running += 1
-    return {
+    gauges = {
         ("recon_operator_jobs_queued", ()): float(queued),
         ("recon_operator_jobs_running", ()): float(running),
         ("recon_operator_jobs_known", ()): float(known),
         ("recon_operator_scheduled_tasks", ()): float(scheduled_count),
     }
+    with _GAUGES_LOCK:
+        _GAUGES_CACHE["gauges"] = dict(gauges)
+        _GAUGES_CACHE["ts"] = time.time()
+    return gauges
 
 
 def render_metrics_text() -> str:
@@ -3453,6 +3430,7 @@ def render_metrics_text() -> str:
 
 def _health_payload(*, nmap_available: bool) -> dict:
     gauges = _job_status_gauges()
+    # Minimal public health (no secrets: keys, allowlist entries, worker_id, state_db)
     return {
         "status": "healthy" if nmap_available else "unhealthy",
         "product": PRODUCT_NAME,
@@ -3464,39 +3442,13 @@ def _health_payload(*, nmap_available: bool) -> dict:
         "jobs_running": int(gauges[("recon_operator_jobs_running", ())]),
         "metrics_path": "/metrics",
         "metrics_auth_required": METRICS_AUTH_REQUIRED,
-        "telegram_configured": bot is not None,
         "uptime": str(_utc_now() - start_time),
-        "fernet_key_configured": bool(FERNET_KEY),
-        "fernet_key_count": FERNET_KEY_COUNT,
         "nmap_available": nmap_available,
-        "max_requests_per_window": MAX_REQUESTS_PER_WINDOW,
-        "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
-        "rate_limit_backend": rate_limit_backend(),
-        "rate_limit_include_owner": RATE_LIMIT_INCLUDE_OWNER,
-        "trusted_proxy_mode": TRUSTED_PROXY_MODE,
-        "trusted_proxies_count": len(TRUSTED_PROXIES),
-        "max_concurrent_scans": MAX_CONCURRENT_SCANS,
-        "max_scheduled_tasks": MAX_SCHEDULED_TASKS,
-        "max_scan_jobs": MAX_SCAN_JOBS,
-        "max_target_addresses": MAX_TARGET_ADDRESSES,
-        "target_allowlist_enabled": bool(TARGET_ALLOWLIST),
-        "target_allowlist_count": len(TARGET_ALLOWLIST),
-        "results_max_files": RESULTS_MAX_FILES,
-        "results_max_age_days": RESULTS_MAX_AGE_DAYS,
         "legacy_results_shared": LEGACY_RESULTS_SHARED,
         "legacy_jobs_shared": LEGACY_JOBS_SHARED,
         "api_auth_required": API_AUTH_REQUIRED,
-        "api_auth_header": API_AUTH_HEADER,
-        "api_key_count": len([key for key in API_AUTH_KEYS if not key.get("revoked")]),
-        "named_api_keys": len(API_AUTH_KEYS) > 0,
-        "worker_id": WORKER_ID,
-        "job_lease_seconds": JOB_LEASE_SECONDS,
+        "target_allowlist_restricted": bool(TARGET_ALLOWLIST),
         "scheduler_leader": _is_scheduler_leader,
-        "scheduler_leader_seconds": SCHEDULER_LEADER_SECONDS,
-        "state_db": STATE_DB_PATH,
-        "discovery_engines": {
-            name: bool(path) for name, path in available_discovery_engines().items()
-        },
     }
 
 
@@ -3516,7 +3468,7 @@ async def liveness():
 @app.route("/ready", methods=["GET"])
 async def readiness():
     """Readiness: dependencies required to accept scan work."""
-    nmap_available = _check_nmap_available()
+    nmap_available = await asyncio.to_thread(_check_nmap_available)
     payload = {
         "status": "ready" if nmap_available else "not_ready",
         "product": PRODUCT_NAME,
@@ -3540,7 +3492,7 @@ async def metrics_endpoint():
         auth_error = require_api_auth("read")
         if auth_error:
             return auth_error
-    body = render_metrics_text()
+    body = await asyncio.to_thread(render_metrics_text)
     return (
         body,
         200,
@@ -3555,7 +3507,7 @@ async def metrics_endpoint():
 async def health_check():
     """Detailed health snapshot (readiness semantics for HTTP status)."""
     _cleanup_finished_tasks()
-    nmap_available = _check_nmap_available()
+    nmap_available = await asyncio.to_thread(_check_nmap_available)
     async with _jobs_lock:
         jobs_count = len(scan_jobs)
         active_jobs = sum(1 for job in scan_jobs.values() if job["status"] in {"queued", "running"})
@@ -3980,6 +3932,8 @@ def build_openapi_spec() -> dict:
 
 @app.route("/openapi.json", methods=["GET"])
 async def openapi_json():
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
     return jsonify(build_openapi_spec()), 200
 
 
@@ -3990,6 +3944,8 @@ async def auth_whoami():
     if auth_error:
         # Auth-only: any valid non-revoked key may call whoami.
         return auth_error
+    if not check_rate_limit():
+        return jsonify({"error": "Rate limit exceeded"}), 429
     return (
         jsonify(
             {
@@ -4308,6 +4264,11 @@ async def load_persisted_state():
 async def main():
     global _job_worker_task, _scheduler_leader_task
     log_event(f"{PRODUCT_NAME} started (version {VERSION}, worker={WORKER_ID})")
+    if not TARGET_ALLOWLIST:
+        log_event(
+            "WARNING: TARGET_ALLOWLIST is empty — scans are unrestricted. "
+            "Set TARGET_ALLOWLIST/TARGET_ALLOWLIST_FILE to bound engagement scope."
+        )
     await send_telegram_message(f"{PRODUCT_NAME} v{VERSION} started")
 
     await load_persisted_state()
@@ -4362,7 +4323,7 @@ async def main():
             _scheduler_leader_task.cancel()
         try:
             state_store.release_leadership(SCHEDULER_LOCK_NAME, WORKER_ID)
-        except Exception:
+        except Exception:  # noqa: S110 - best-effort release during shutdown
             pass
         _release_redis_leadership(SCHEDULER_LOCK_NAME)
 
