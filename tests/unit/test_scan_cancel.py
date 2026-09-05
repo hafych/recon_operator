@@ -12,9 +12,12 @@ import unittest
 os.environ.setdefault("API_AUTH_REQUIRED", "true")
 os.environ.setdefault("API_AUTH_TOKEN", "test-token")
 os.environ.setdefault("FERNET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+os.environ.setdefault("SCAN_LOG_PATH", "/tmp/recon-operator-scan-cancel.log")
+os.environ.setdefault("STATE_DB_PATH", "/tmp/recon-operator-scan-cancel.db")
 
 from scan_engine import (
     SCHEMA_VERSION,
+    _process_group_id,
     _register_process,
     _run_tracked,
     _unregister_process,
@@ -63,6 +66,33 @@ class ProcessCancelTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertIn("ok", completed.stdout or "")
         self.assertFalse(kill_active_process(token))
+
+    def test_process_group_id_requires_own_session_leader(self):
+        # Session leader: pgid must equal pid.
+        leader = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            self.assertEqual(_process_group_id(leader), leader.pid)
+            # Non-leader child sharing the parent's group: never signalable.
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                self.assertIsNone(_process_group_id(child))
+            finally:
+                child.kill()
+                child.wait(timeout=5)
+        finally:
+            leader.kill()
+            leader.wait(timeout=5)
+        # Recycled/dead pid: no group to signal.
+        self.assertIsNone(_process_group_id(leader))
 
 
 class ProcessCancelExtraTests(unittest.TestCase):

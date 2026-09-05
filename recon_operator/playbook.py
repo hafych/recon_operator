@@ -7,12 +7,13 @@ Does not auto-execute planner commands. Only queues authorized scan profiles
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Any
 
 from recon_operator.presets import PHASE_ORDER, get_preset
 
 DEFAULT_PLAYBOOK_ID = "standard"
-PLAYBOOKS: Dict[str, Dict[str, Any]] = {
+PLAYBOOKS: dict[str, dict[str, Any]] = {
     "standard": {
         "id": "standard",
         "label": "Standard recon chain",
@@ -34,7 +35,7 @@ PLAYBOOKS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def list_playbooks() -> List[Dict[str, Any]]:
+def list_playbooks() -> list[dict[str, Any]]:
     rows = [dict(value) for value in PLAYBOOKS.values()]
     rows.sort(key=lambda item: item.get("id") or "")
     return rows
@@ -42,14 +43,14 @@ def list_playbooks() -> List[Dict[str, Any]]:
 
 def resolve_phases(
     *,
-    playbook: Optional[str] = None,
-    phases: Optional[Sequence[str]] = None,
-) -> Tuple[Optional[List[str]], Optional[str], Optional[str]]:
+    playbook: str | None = None,
+    phases: Sequence[str] | None = None,
+) -> tuple[list[str] | None, str | None, str | None]:
     """Return (phase_ids, playbook_id, error)."""
     if phases is not None:
         if not isinstance(phases, (list, tuple)) or not phases:
             return None, None, "phases must be a non-empty list of preset ids"
-        resolved: List[str] = []
+        resolved: list[str] = []
         for raw in phases:
             key = str(raw or "").strip().lower()
             if not key:
@@ -73,7 +74,7 @@ def build_engagement_record(
     phase_ids: Sequence[str],
     playbook_id: str,
     owner_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     engagement_id = str(uuid.uuid4())
     steps = []
     for index, phase_id in enumerate(phase_ids):
@@ -104,7 +105,7 @@ def build_engagement_record(
     }
 
 
-def public_engagement_view(record: Dict[str, Any]) -> Dict[str, Any]:
+def public_engagement_view(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "engagement_id": record.get("engagement_id"),
         "playbook": record.get("playbook"),

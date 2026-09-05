@@ -39,7 +39,7 @@ UI_HTML = r"""<!doctype html>
           <summary class="button secondary">Connection</summary>
           <div class="connection-popover">
             <label for="apiToken">API token</label>
-            <input id="apiToken" type="password" autocomplete="off" placeholder="X-API-KEY">
+            <input id="apiToken" type="password" autocomplete="new-password" placeholder="X-API-KEY">
             <p class="field-help" id="keyMeta" aria-live="polite">Key not identified.</p>
             <div class="button-row compact">
               <button class="button primary" id="connectBtn" type="button">Connect</button>

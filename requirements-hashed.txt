@@ -1,0 +1,17 @@
+# Hashed requirements for reproducible installs (pip install --require-hashes -r requirements-hashed.txt)
+# Generated 2026-08-23 via pip hash from PyPI wheels (macOS arm64 for cryptography, universal for others)
+# For Linux manylinux, add additional --hash from https://pypi.org/project/cryptography/#files
+python-telegram-bot==22.8 \
+    --hash=sha256:42373918097f1b837cc4e717d588c19ea79651497ec712bb5b0c76e5e63c50e1
+cryptography==50.0.0 \
+    --hash=sha256:031e2d5dd4bb9caa3ca9c82e5a197fd8ae680232cee62603d1a813f3f07e3d03
+quart==0.22.0 \
+    --hash=sha256:bb659545f1a8a287a14df9434b9225a3d4738362a3ed170744d0e03bb9447b50
+Flask==3.1.3 \
+    --hash=sha256:f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c
+python-dotenv==1.2.3 \
+    --hash=sha256:904552145e8bfed22162c09dab1c2b9b54fefa7b23ba780f4f26ca0316b0f0d9
+defusedxml==0.7.1 \
+    --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
+redis==8.1.0 \
+    --hash=sha256:a4fe1aac3d3b3cc791d4b3d5931c5a956045dc951ee74d1c913ee3ac4d2ee9fb

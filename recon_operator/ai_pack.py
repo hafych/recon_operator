@@ -8,7 +8,9 @@ Closed ports are omitted by default. No secrets are ever included.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+import re
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from recon_operator.posture import load_expected_posture, posture_pack_rows
 from recon_planner import build_recon_plan
@@ -19,6 +21,64 @@ SCHEMA_VERSION = "recon-ai-pack/v1"
 # Hard caps for budget=s (enforced after build; builder also tries to stay under).
 BUDGET_S_MAX_BYTES = 4 * 1024
 BUDGET_S_MAX_LINES = 100
+
+# Hard byte caps for medium/large budgets (like budget=s, enforced after build).
+BUDGET_M_MAX_BYTES = 64 * 1024
+BUDGET_L_MAX_BYTES = 256 * 1024
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_text(value: Any, *, max_len: int = 200) -> str | None:
+    """Strip control characters and bound length from untrusted scan data.
+
+    Scan fields (hostnames, banners, product/version strings, NSE output)
+    originate from remote hosts and may carry ANSI escapes, newlines, or
+    prompt-injection payloads aimed at LLM consumers of the pack. Normalize
+    them before emission so data cannot smuggle formatting or instructions.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    text = _CONTROL_CHARS_RE.sub(" ", text)
+    text = " ".join(text.split())
+    if len(text) > max_len:
+        text = text[:max_len]
+    text = text.strip()
+    return text or None
+
+
+def _budget_hard_bytes(budget_key: str) -> int | None:
+    if budget_key == "s":
+        return BUDGET_S_MAX_BYTES
+    if budget_key == "m":
+        return BUDGET_M_MAX_BYTES
+    if budget_key == "l":
+        return BUDGET_L_MAX_BYTES
+    return None
+
+
+def _apply_hard_caps(
+    rows: list[dict[str, Any]], *, budget_key: str, fmt: str = "jsonl"
+) -> list[dict[str, Any]]:
+    """Enforce byte caps for the budget after build (s uses the stamping path)."""
+    max_bytes = _budget_hard_bytes(budget_key)
+    if max_bytes is None or not rows:
+        return rows
+    if budget_key == "s":
+        return _apply_budget_s_hard_caps(rows)
+    # For m/l, use format-aware serialized bytes (pack_to_json vs NDJSON)
+    if fmt == "json":
+        # Iteratively trim tail until serialized JSON fits
+        stamped = _stamp_budget_s_meta(rows, truncated=False, original_len=len(rows))
+        while (
+            stamped and _serialized_pack_bytes(stamped, fmt="json") > max_bytes and len(stamped) > 1
+        ):
+            stamped = stamped[:-1]
+            stamped = _stamp_budget_s_meta(stamped, truncated=True, original_len=len(rows))
+        return stamped
+    return _enforce_hard_caps(rows, max_lines=len(rows), max_bytes=max_bytes)
+
 
 # Soft targets used while building (leave headroom for meta).
 _BUDGET_LIMITS = {
@@ -70,7 +130,7 @@ _BUDGET_LIMITS = {
 }
 
 # Simple defense/hardening hints (no exploitation).
-_DEFENSE_HINTS: Dict[str, Tuple[str, str]] = {
+_DEFENSE_HINTS: dict[str, tuple[str, str]] = {
     "ssh": (
         "D-SSH-01",
         "Restrict SSH to management networks; prefer key-only auth and fail2ban/rate limits.",
@@ -122,23 +182,23 @@ def normalize_budget(raw: Any) -> str:
 
 
 def _iter_services(
-    scan: Dict[str, Any],
+    scan: dict[str, Any],
     *,
-    states: Set[str],
-) -> Iterable[Dict[str, Any]]:
+    states: set[str],
+) -> Iterable[dict[str, Any]]:
     hosts = scan.get("hosts") if isinstance(scan, dict) else None
     if not isinstance(hosts, list):
         return
     for host_row in hosts:
         if not isinstance(host_row, dict):
             continue
-        host = str(host_row.get("host") or "").strip()
+        host = _sanitize_text(host_row.get("host"), max_len=253)
         if not host:
             continue
-        hostname = host_row.get("hostname")
+        hostname = _sanitize_text(host_row.get("hostname"), max_len=253)
         if hostname in (None, "", "N/A"):
             hostname = None
-        host_state = str(host_row.get("state") or "unknown")
+        host_state = _sanitize_text(host_row.get("state"), max_len=32) or "unknown"
         protocols = host_row.get("protocols") or {}
         if not isinstance(protocols, dict):
             continue
@@ -164,17 +224,17 @@ def _iter_services(
                     "protocol": str(protocol or "tcp"),
                     "port": port,
                     "state": port_state,
-                    "name": str(port_row.get("name") or "unknown").lower(),
-                    "product": port_row.get("product"),
-                    "version": port_row.get("version"),
+                    "name": (_sanitize_text(port_row.get("name"), max_len=64) or "unknown").lower(),
+                    "product": _sanitize_text(port_row.get("product"), max_len=200),
+                    "version": _sanitize_text(port_row.get("version"), max_len=200),
                 }
 
 
-def _iter_open_services(scan: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+def _iter_open_services(scan: dict[str, Any]) -> Iterable[dict[str, Any]]:
     yield from _iter_services(scan, states={"open"})
 
 
-def _finding_for_service(svc: Dict[str, Any], index: int) -> Dict[str, Any]:
+def _finding_for_service(svc: dict[str, Any], index: int) -> dict[str, Any]:
     service = svc["name"]
     code = service.upper().replace("/", "-")[:12] or "SVC"
     title = f"Open {svc['protocol']}/{svc['port']} ({service})"
@@ -197,7 +257,7 @@ def _finding_for_service(svc: Dict[str, Any], index: int) -> Dict[str, Any]:
     }
 
 
-def _defense_for_service(svc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _defense_for_service(svc: dict[str, Any]) -> dict[str, Any] | None:
     service = svc["name"]
     hint = _DEFENSE_HINTS.get(service)
     if not hint:
@@ -219,21 +279,21 @@ def _defense_for_service(svc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _line_bytes(row: Dict[str, Any]) -> int:
+def _line_bytes(row: dict[str, Any]) -> int:
     return len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
 
 
 def build_ai_pack_rows(
-    scan: Dict[str, Any],
+    scan: dict[str, Any],
     *,
     budget: str = "s",
-    inventory: Optional[Dict[str, Any]] = None,
+    inventory: dict[str, Any] | None = None,
     include_closed: bool = False,
-    job_id: Optional[str] = None,
-    result_id: Optional[str] = None,
-    plan: Optional[Dict[str, Any]] = None,
-    expected_posture: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+    job_id: str | None = None,
+    result_id: str | None = None,
+    plan: dict[str, Any] | None = None,
+    expected_posture: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Build ordered pack rows for the given budget.
 
     Closed ports are omitted unless ``include_closed`` is true (rarely needed).
@@ -249,23 +309,23 @@ def build_ai_pack_rows(
             expected_posture = None
 
     include_closed_effective = bool(include_closed and budget_key == "l")
-    hosts_seen_all: List[str] = []
-    host_meta: Dict[str, Dict[str, Any]] = {}
+    hosts_seen_all: list[str] = []
+    host_meta: dict[str, dict[str, Any]] = {}
     scan_hosts = scan.get("hosts")
     for host_row in scan_hosts if isinstance(scan_hosts, list) else []:
         if not isinstance(host_row, dict):
             continue
-        host = str(host_row.get("host") or "").strip()
+        host = _sanitize_text(host_row.get("host"), max_len=253)
         if not host:
             continue
         if host not in host_meta:
             hosts_seen_all.append(host)
-            hostname = host_row.get("hostname")
+            hostname = _sanitize_text(host_row.get("hostname"), max_len=253)
             host_meta[host] = {
                 "t": "host",
                 "ip": host,
                 "hostname": hostname if hostname not in (None, "", "N/A") else None,
-                "status": str(host_row.get("state") or "unknown"),
+                "status": _sanitize_text(host_row.get("state"), max_len=32) or "unknown",
             }
 
     hosts_seen = hosts_seen_all[: int(limits["max_hosts"])]
@@ -276,8 +336,8 @@ def build_ai_pack_rows(
         service for service in all_open_services if service["host"] in allowed_hosts
     ]
     open_services = eligible_open_services[:max_services]
-    all_closed_services: List[Dict[str, Any]] = []
-    eligible_closed_services: List[Dict[str, Any]] = []
+    all_closed_services: list[dict[str, Any]] = []
+    eligible_closed_services: list[dict[str, Any]] = []
     if include_closed_effective:
         all_closed_services = list(_iter_services(scan, states={"closed"}))
         eligible_closed_services = [
@@ -291,13 +351,14 @@ def build_ai_pack_rows(
         or (include_closed_effective and len(closed_services) < len(all_closed_services))
     )
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     meta = {
         "t": "meta",
         "schema": SCHEMA_VERSION,
         "budget": budget_key,
-        "target": scan.get("target"),
-        "scan_type": scan.get("scan_type"),
+        "target": _sanitize_text(scan.get("target"), max_len=253),
+        "scan_type": _sanitize_text(scan.get("scan_type"), max_len=64),
+        "data_is_untrusted": True,
         "open_services": len(open_services),
         "closed_services": len(closed_services),
         "hosts": len(hosts_seen),
@@ -311,9 +372,9 @@ def build_ai_pack_rows(
         "usage": "Prefer this pack over full result JSON in LLM context",
     }
     if job_id:
-        meta["job_id"] = str(job_id)[:64]
+        meta["job_id"] = _sanitize_text(job_id, max_len=64)
     if result_id:
-        meta["result_id"] = str(result_id)[:260]
+        meta["result_id"] = _sanitize_text(result_id, max_len=260)
     rows.append(meta)
 
     for host in hosts_seen:
@@ -348,9 +409,9 @@ def build_ai_pack_rows(
         findings.append(_finding_for_service(svc, index))
     rows.extend(findings)
 
-    defense_rows: List[Dict[str, Any]] = []
+    defense_rows: list[dict[str, Any]] = []
     if limits["include_defense"]:
-        seen_defense: Set[str] = set()
+        seen_defense: set[str] = set()
         for svc in open_services:
             if len(defense_rows) >= int(limits["max_defense"]):
                 break
@@ -395,33 +456,34 @@ def build_ai_pack_rows(
             rows.append(
                 {
                     "t": "next",
-                    "tool": rec.get("tool"),
-                    "status": rec.get("status"),
-                    "host": rec.get("host"),
+                    "tool": _sanitize_text(rec.get("tool"), max_len=64),
+                    "status": _sanitize_text(rec.get("status"), max_len=16),
+                    "host": _sanitize_text(rec.get("host"), max_len=253),
                     "port": rec.get("port"),
-                    "service": rec.get("service"),
-                    "cmd": rec.get("command"),
-                    "purpose": rec.get("purpose"),
+                    "service": _sanitize_text(rec.get("service"), max_len=64),
+                    "cmd": _sanitize_text(rec.get("command"), max_len=500),
+                    "purpose": _sanitize_text(rec.get("purpose"), max_len=200),
                 }
             )
             next_count += 1
 
         gap_count = 0
-        seen_packages: Set[str] = set()
+        seen_packages: set[str] = set()
         for rec in missing:
             if gap_count >= int(limits["max_gap"]):
                 break
-            package = str(rec.get("package") or rec.get("tool") or "")
+            package = _sanitize_text(rec.get("package") or rec.get("tool"), max_len=64)
             if not package or package in seen_packages:
                 continue
             seen_packages.add(package)
+            tool = _sanitize_text(rec.get("tool"), max_len=64)
             rows.append(
                 {
                     "t": "gap",
-                    "tool": rec.get("tool"),
+                    "tool": tool,
                     "package": package,
                     "status": "missing",
-                    "hint": f"Install package '{package}' to enable {rec.get('tool')}",
+                    "hint": f"Install package '{package}' to enable {tool or 'the tool'}",
                 }
             )
             gap_count += 1
@@ -438,7 +500,7 @@ def build_ai_pack_rows(
     rows.extend(posture_rows)
 
     # Clarifying questions (cheap, capped).
-    ask_rows: List[Dict[str, Any]] = []
+    ask_rows: list[dict[str, Any]] = []
     if open_services:
         ask_rows.append(
             {
@@ -462,19 +524,18 @@ def build_ai_pack_rows(
         )
     rows.extend(ask_rows[: int(limits["max_ask"])])
 
-    # Enforce hard caps for budget=s after build (trim tail, keep meta).
-    if budget_key == "s":
-        rows = _apply_budget_s_hard_caps(rows)
+    # Enforce hard caps after build (trim tail, keep meta).
+    rows = _apply_hard_caps(rows, budget_key=budget_key)
 
     return rows
 
 
 def _enforce_hard_caps(
-    rows: List[Dict[str, Any]], *, max_lines: int, max_bytes: int
-) -> List[Dict[str, Any]]:
+    rows: list[dict[str, Any]], *, max_lines: int, max_bytes: int
+) -> list[dict[str, Any]]:
     if not rows:
         return rows
-    kept: List[Dict[str, Any]] = [rows[0]]
+    kept: list[dict[str, Any]] = [rows[0]]
     size = _line_bytes(rows[0])
     for row in rows[1:]:
         if len(kept) >= max_lines:
@@ -491,8 +552,8 @@ def _enforce_hard_caps(
 
 
 def _stamp_budget_s_meta(
-    rows: List[Dict[str, Any]], *, truncated: bool, original_len: int
-) -> List[Dict[str, Any]]:
+    rows: list[dict[str, Any]], *, truncated: bool, original_len: int
+) -> list[dict[str, Any]]:
     """Attach truncated/lines/bytes to meta so the serialized size is self-consistent."""
     if not rows:
         return rows
@@ -518,7 +579,7 @@ def _stamp_budget_s_meta(
     return provisional
 
 
-def _apply_budget_s_hard_caps(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _apply_budget_s_hard_caps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Trim until the final stamped pack fits both hard caps (no post-stamp overflow)."""
     if not rows:
         return rows
@@ -561,17 +622,17 @@ def _apply_budget_s_hard_caps(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return kept
 
 
-def pack_bytes(rows: Sequence[Dict[str, Any]]) -> int:
+def pack_bytes(rows: Sequence[dict[str, Any]]) -> int:
     return sum(_line_bytes(row) for row in rows)
 
 
-def pack_to_ndjson(rows: Sequence[Dict[str, Any]]) -> str:
+def pack_to_ndjson(rows: Sequence[dict[str, Any]]) -> str:
     return (
         "\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in rows) + "\n"
     )
 
 
-def pack_to_json(rows: Sequence[Dict[str, Any]]) -> str:
+def pack_to_json(rows: Sequence[dict[str, Any]]) -> str:
     return json.dumps(
         {"schema": SCHEMA_VERSION, "rows": list(rows)},
         ensure_ascii=False,
@@ -579,7 +640,7 @@ def pack_to_json(rows: Sequence[Dict[str, Any]]) -> str:
     )
 
 
-def _serialized_pack_bytes(rows: Sequence[Dict[str, Any]], fmt: str) -> int:
+def _serialized_pack_bytes(rows: Sequence[dict[str, Any]], fmt: str) -> int:
     if fmt == "json":
         body = pack_to_json(rows)
     else:
@@ -588,12 +649,12 @@ def _serialized_pack_bytes(rows: Sequence[Dict[str, Any]], fmt: str) -> int:
 
 
 def _stamp_serialized_meta(
-    rows: List[Dict[str, Any]],
+    rows: list[dict[str, Any]],
     *,
     fmt: str,
     truncated: bool,
     original_len: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Stamp metadata for the actual response serialization, including wrapper bytes."""
     if not rows:
         return rows
@@ -614,7 +675,7 @@ def _stamp_serialized_meta(
     return stamped
 
 
-def _fit_budget_s_serialization(rows: List[Dict[str, Any]], *, fmt: str) -> List[Dict[str, Any]]:
+def _fit_budget_s_serialization(rows: list[dict[str, Any]], *, fmt: str) -> list[dict[str, Any]]:
     """Make the final JSON or JSONL representation honor the advertised hard cap."""
     if not rows:
         return rows
@@ -665,27 +726,28 @@ def _fit_budget_s_serialization(rows: List[Dict[str, Any]], *, fmt: str) -> List
 
 
 def _inventory_delta_rows(
-    recommendations: Sequence[Dict[str, Any]], *, max_rows: int
-) -> List[Dict[str, Any]]:
+    recommendations: Sequence[dict[str, Any]], *, max_rows: int
+) -> list[dict[str, Any]]:
     """Compact package readiness rows only for tools tied to open services."""
-    rows: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for rec in recommendations:
         if not isinstance(rec, dict):
             continue
-        package = str(rec.get("package") or rec.get("tool") or "").strip()
+        package = _sanitize_text(rec.get("package") or rec.get("tool"), max_len=64)
         if not package or package in seen:
             continue
         seen.add(package)
-        status = str(rec.get("status") or "unknown")
+        status = _sanitize_text(rec.get("status"), max_len=16) or "unknown"
+        service = _sanitize_text(rec.get("service"), max_len=64) or "service"
         rows.append(
             {
                 "t": "inv",
                 "package": package,
-                "tool": rec.get("tool"),
+                "tool": _sanitize_text(rec.get("tool"), max_len=64),
                 "status": status,
-                "service": rec.get("service"),
-                "reason": f"relevant to open {rec.get('service') or 'service'}",
+                "service": service,
+                "reason": f"relevant to open {service}",
             }
         )
         if len(rows) >= max_rows:
@@ -699,13 +761,13 @@ def _change_finding_id(kind: str, host: str, protocol: str, port: int) -> str:
 
 
 def build_retest_pack_rows(
-    baseline: Dict[str, Any],
-    current: Dict[str, Any],
+    baseline: dict[str, Any],
+    current: dict[str, Any],
     *,
     budget: str = "s",
-    inventory: Optional[Dict[str, Any]] = None,
-    expected_posture: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+    inventory: dict[str, Any] | None = None,
+    expected_posture: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Compact retest brief: current open services + defense + diff-focused changes."""
     if not isinstance(baseline, dict) or not isinstance(current, dict):
         raise ValueError("baseline and current must be parsed scan objects")
@@ -740,12 +802,12 @@ def build_retest_pack_rows(
         "ports_opened": len(diff.get("ports_opened") or []),
         "ports_closed": len(diff.get("ports_closed") or []),
     }
-    change_rows: List[Dict[str, Any]] = []
+    change_rows: list[dict[str, Any]] = []
     for item in diff.get("ports_opened") or []:
         if not isinstance(item, dict):
             continue
-        host = str(item.get("host") or "")
-        protocol = str(item.get("protocol") or "tcp")
+        host = _sanitize_text(item.get("host"), max_len=253) or ""
+        protocol = _sanitize_text(item.get("protocol"), max_len=16) or "tcp"
         try:
             port = int(item.get("port"))
         except (TypeError, ValueError):
@@ -758,7 +820,8 @@ def build_retest_pack_rows(
                 "host": host,
                 "port": port,
                 "proto": protocol,
-                "service": item.get("service") or item.get("name") or "unknown",
+                "service": _sanitize_text(item.get("service") or item.get("name"), max_len=64)
+                or "unknown",
             }
         )
         if len(change_rows) >= int(limits["max_changes"]):
@@ -767,8 +830,8 @@ def build_retest_pack_rows(
         for item in diff.get("ports_closed") or []:
             if not isinstance(item, dict):
                 continue
-            host = str(item.get("host") or "")
-            protocol = str(item.get("protocol") or "tcp")
+            host = _sanitize_text(item.get("host"), max_len=253) or ""
+            protocol = _sanitize_text(item.get("protocol"), max_len=16) or "tcp"
             try:
                 port = int(item.get("port"))
             except (TypeError, ValueError):
@@ -781,35 +844,35 @@ def build_retest_pack_rows(
                     "host": host,
                     "port": port,
                     "proto": protocol,
-                    "service": item.get("service") or item.get("name") or "unknown",
+                    "service": _sanitize_text(item.get("service") or item.get("name"), max_len=64)
+                    or "unknown",
                 }
             )
             if len(change_rows) >= int(limits["max_changes"]):
                 break
 
     rows = rows[:insert_at] + [diff_row] + change_rows + rows[insert_at:]
-    if budget_key == "s":
-        rows = _apply_budget_s_hard_caps(rows)
-        if rows and rows[0].get("t") == "meta":
-            rows[0] = dict(rows[0])
-            rows[0]["mode"] = "retest"
+    rows = _apply_hard_caps(rows, budget_key=budget_key)
+    if rows and rows[0].get("t") == "meta":
+        rows[0] = dict(rows[0])
+        rows[0]["mode"] = "retest"
     return rows
 
 
 def build_ai_pack(
-    scan: Dict[str, Any],
+    scan: dict[str, Any],
     *,
     budget: str = "s",
-    inventory: Optional[Dict[str, Any]] = None,
+    inventory: dict[str, Any] | None = None,
     format: str = "jsonl",
-    job_id: Optional[str] = None,
-    result_id: Optional[str] = None,
-    plan: Optional[Dict[str, Any]] = None,
+    job_id: str | None = None,
+    result_id: str | None = None,
+    plan: dict[str, Any] | None = None,
     include_closed: bool = False,
-    baseline: Optional[Dict[str, Any]] = None,
-    mode: Optional[str] = None,
-    expected_posture: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, str, List[Dict[str, Any]]]:
+    baseline: dict[str, Any] | None = None,
+    mode: str | None = None,
+    expected_posture: dict[str, Any] | None = None,
+) -> tuple[str, str, list[dict[str, Any]]]:
     """Return (body, content_type, rows).
 
     When ``mode=retest`` or ``baseline`` is provided, builds a retest-oriented pack.
@@ -840,6 +903,8 @@ def build_ai_pack(
     fmt_key = "json" if fmt in {"json", "application/json"} else "jsonl"
     if normalize_budget(budget) == "s":
         rows = _fit_budget_s_serialization(rows, fmt=fmt_key)
+    elif fmt_key == "json" and normalize_budget(budget) in {"m", "l"}:
+        rows = _apply_hard_caps(rows, budget_key=normalize_budget(budget), fmt="json")
     if fmt_key == "json":
         return pack_to_json(rows), "application/json; charset=utf-8", rows
     return pack_to_ndjson(rows), "application/x-ndjson; charset=utf-8", rows
@@ -849,10 +914,10 @@ def pack_from_json_file(
     path: str,
     *,
     budget: str = "s",
-    inventory: Optional[Dict[str, Any]] = None,
+    inventory: dict[str, Any] | None = None,
     format: str = "jsonl",
-    baseline_path: Optional[str] = None,
-) -> Tuple[str, str, List[Dict[str, Any]]]:
+    baseline_path: str | None = None,
+) -> tuple[str, str, list[dict[str, Any]]]:
     """Offline helper: load scan JSON from disk and build a pack (CLI path)."""
     from pathlib import Path
 

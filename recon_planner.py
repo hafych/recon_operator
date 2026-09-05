@@ -4,7 +4,6 @@ import ipaddress
 import json
 import re
 import shlex
-from typing import Dict, List
 
 SCHEMA_VERSION = "service-recon-plan/v1"
 
@@ -154,7 +153,7 @@ SERVICE_PROFILES = [
 ]
 
 
-def _inventory_status(inventory: Dict) -> Dict[str, bool]:
+def _inventory_status(inventory: dict) -> dict[str, bool]:
     status = {}
     for package in inventory.get("packages", []) if inventory else []:
         if not isinstance(package, dict):
@@ -181,7 +180,7 @@ def _inventory_status(inventory: Dict) -> Dict[str, bool]:
     return status
 
 
-def _service_matches(profile: Dict, protocol: str, port: int, service: str) -> bool:
+def _service_matches(profile: dict, protocol: str, port: int, service: str) -> bool:
     if protocol not in profile.get("protocols", {"tcp"}):
         return False
     if port in profile["ports"]:
@@ -245,7 +244,7 @@ def _format_command(template: str, host: str, hostname: str, port: int, service:
     )
 
 
-def build_recon_plan(scan: Dict, inventory: Dict = None) -> Dict:
+def build_recon_plan(scan: dict, inventory: dict = None) -> dict:
     tool_status = _inventory_status(inventory or {})
     recommendations = []
     seen = set()
@@ -334,7 +333,7 @@ def build_recon_plan(scan: Dict, inventory: Dict = None) -> Dict:
     }
 
 
-def recon_plan_to_jsonl(plan: Dict) -> str:
+def recon_plan_to_jsonl(plan: dict) -> str:
     rows = [
         {
             "schema": plan["schema"],
@@ -347,8 +346,8 @@ def recon_plan_to_jsonl(plan: Dict) -> str:
     return "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
 
 
-def recon_plan_to_markdown(plan: Dict) -> str:
-    lines: List[str] = [
+def recon_plan_to_markdown(plan: dict) -> str:
+    lines: list[str] = [
         "# Recon Plan",
         "",
         f"- Schema: `{plan['schema']}`",

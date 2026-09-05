@@ -285,7 +285,7 @@ Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing th
 | `TARGET_ALLOWLIST` | empty | Optional engagement scope: IPs, CIDRs, hostnames, `*.domain` (comma or JSON) |
 | `TARGET_ALLOWLIST_FILE` | empty | Optional file of allowlist entries (`#` comments allowed); empty = unrestricted |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum JSON request body size |
-| `MAX_IMPORT_XML_BYTES` | `67108864` | Maximum imported Nmap XML size |
+| `MAX_IMPORT_XML_BYTES` | `16777216` | Maximum imported Nmap XML size (16 MiB) |
 | `MAX_REQUESTS_PER_WINDOW` | `10` | Per-client costly-request limit |
 | `MAX_RATE_LIMIT_CLIENTS` | `10000` | Maximum retained client buckets (memory backend) |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window |
@@ -306,7 +306,8 @@ Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing th
 | `RESULTS_DIR` | `encrypted_results` | Encrypted result directory |
 | `RESULTS_MAX_FILES` | `500` | Max encrypted result files retained |
 | `RESULTS_MAX_AGE_DAYS` | `0` | Delete results older than N days (`0` = off) |
-| `LEGACY_RESULTS_SHARED` | `true` | Show pre-ownership result files to any auth operator; set `false` for multi-token isolation |
+| `LEGACY_RESULTS_SHARED` | `false` | Show pre-ownership result files to any auth operator; set `true` only for single-operator compat with pre-1.7 files |
+| `LEGACY_JOBS_SHARED` | `false` | Show/cancel pre-ownership jobs and scheduled tasks to any auth operator; set `true` only for single-operator compat |
 | `STATE_DB_PATH` | `data/recon_operator.db` | SQLite for jobs + scheduled tasks |
 | `AI_REPORTS_MAX_DIRS` | `100` | Max CLI `ai_reports` run directories retained |
 | `AI_REPORTS_MAX_AGE_DAYS` | `0` | Delete CLI report dirs older than N days (`0` = off) |
@@ -315,6 +316,7 @@ Call `GET /auth/whoami` to confirm key id, label, and scopes without exposing th
 | `INITIAL_TASKS` | `[]` | JSON array of startup recurring scans |
 | `TELEGRAM_BOT_TOKEN` | empty | Optional Telegram bot token |
 | `TELEGRAM_CHAT_ID` | empty | Optional Telegram destination |
+| `TELEGRAM_INCLUDE_TARGET` | `false` | Include the scan target in Telegram notifications |
 
 ## Encrypted results
 
@@ -334,7 +336,8 @@ task ids use the same owner hash prefix.
 | Single token (default) | Same as before; new files get an owner prefix, all APIs work |
 | Multiple tokens | Each operator only sees their jobs, schedules, and owned result files |
 | Pre-1.7 result files (no `o…_` prefix) | Visible to any authenticated operator while `LEGACY_RESULTS_SHARED=true` |
-| Multi-token harden | Set `LEGACY_RESULTS_SHARED=false` to hide unowned legacy files |
+| Pre-1.7 jobs/tasks (no owner) | Visible and cancellable while `LEGACY_JOBS_SHARED=true` |
+| Multi-token harden | Set `LEGACY_RESULTS_SHARED=false` and `LEGACY_JOBS_SHARED=false` to hide unowned legacy data |
 
 Clients that previously assumed `POST /scan` always returned the scan body should use
 `?wait=1` or poll `GET /jobs/<job_id>`. Cancel scripts should use the `task_id` returned

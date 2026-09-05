@@ -40,8 +40,22 @@ MAX_SCRIPT_ROWS = 256
 MAX_SCRIPT_OUTPUT_CHARS = 20_000
 MAX_OS_MATCHES = 32
 MAX_TRACE_HOPS = 256
+MAX_HOSTS = 5000
+MAX_PORTS_PER_HOST = 1000
 AI_REPORTS_MAX_DIRS = int(os.getenv("AI_REPORTS_MAX_DIRS", "100"))
 AI_REPORTS_MAX_AGE_DAYS = int(os.getenv("AI_REPORTS_MAX_AGE_DAYS", "0"))
+
+
+def _sanitize(value, *, max_len: int = 200) -> str:
+    """Strip control characters and cap length of remote-origin (untrusted) text.
+
+    Nmap XML attributes — banners, script output, hostnames — come from remote
+    hosts and may carry ANSI escapes, newlines, or prompt-injection payloads
+    aimed at LLM consumers of the report artifacts.
+    """
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))
+    text = " ".join(text.split())
+    return text[:max_len]
 
 
 def utc_now() -> str:
@@ -55,7 +69,7 @@ def reject_suspicious_target(target: str) -> None:
 
 def run_command(args: list, timeout: int = 10) -> dict:
     try:
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 - argv-only, shell=False
             args,
             capture_output=True,
             check=False,
@@ -68,8 +82,8 @@ def run_command(args: list, timeout: int = 10) -> dict:
     return {
         "ok": completed.returncode == 0,
         "returncode": completed.returncode,
-        "stdout": completed.stdout.strip(),
-        "stderr": completed.stderr.strip(),
+        "stdout": completed.stdout.strip()[:2000],
+        "stderr": completed.stderr.strip()[:2000],
         "command": args,
     }
 
@@ -111,8 +125,8 @@ def primary_host_id(host: dict) -> str:
 def _parse_script_rows(nodes) -> list:
     rows = []
     for node in list(nodes)[:MAX_SCRIPT_ROWS]:
-        script_id = str(node.attrib.get("id") or "").strip()[:200]
-        output = str(node.attrib.get("output") or "")[:MAX_SCRIPT_OUTPUT_CHARS]
+        script_id = _sanitize(node.attrib.get("id"), max_len=200)
+        output = _sanitize(node.attrib.get("output"), max_len=MAX_SCRIPT_OUTPUT_CHARS)
         if script_id or output:
             rows.append({"id": script_id, "output": output})
     return rows
@@ -127,21 +141,29 @@ def parse_nmap_xml(xml_path: Path) -> dict:
     if root.tag != "nmaprun":
         raise ValueError(f"Expected <nmaprun> root, found <{root.tag}>")
     hosts = []
+    host_nodes = root.findall("host")
+    if len(host_nodes) > MAX_HOSTS:
+        raise ValueError(f"Nmap XML hosts exceeds safety limit ({MAX_HOSTS})")
 
-    for host_node in root.findall("host"):
+    for host_node in host_nodes:
         status_node = host_node.find("status")
         addresses = [
-            {"addr": node.attrib.get("addr", ""), "type": node.attrib.get("addrtype", "")}
+            {
+                "addr": _sanitize(node.attrib.get("addr"), max_len=253),
+                "type": _sanitize(node.attrib.get("addrtype"), max_len=32),
+            }
             for node in host_node.findall("address")
         ]
         hostnames = [
-            node.attrib.get("name", "")
+            _sanitize(node.attrib.get("name"), max_len=253)
             for node in host_node.findall("./hostnames/hostname")
             if node.attrib.get("name")
         ]
         ports = []
 
-        for port_node in host_node.findall("./ports/port"):
+        for idx, port_node in enumerate(host_node.findall("./ports/port")):
+            if idx >= MAX_PORTS_PER_HOST:
+                break
             try:
                 port_number = int(port_node.attrib.get("portid", "0"))
             except (TypeError, ValueError):
@@ -153,28 +175,44 @@ def parse_nmap_xml(xml_path: Path) -> dict:
             script_rows = _parse_script_rows(port_node.findall("script"))
             ports.append(
                 {
-                    "protocol": port_node.attrib.get("protocol", ""),
+                    "protocol": _sanitize(port_node.attrib.get("protocol"), max_len=16),
                     "port": port_number,
-                    "state": state_node.attrib.get("state", "unknown")
-                    if state_node is not None
-                    else "unknown",
-                    "reason": state_node.attrib.get("reason", "") if state_node is not None else "",
+                    "state": _sanitize(
+                        state_node.attrib.get("state") if state_node is not None else None,
+                        max_len=32,
+                    )
+                    or "unknown",
+                    "reason": _sanitize(
+                        state_node.attrib.get("reason") if state_node is not None else None,
+                        max_len=64,
+                    ),
                     "service": {
-                        "name": service_node.attrib.get("name", "")
-                        if service_node is not None
-                        else "",
-                        "product": service_node.attrib.get("product", "")
-                        if service_node is not None
-                        else "",
-                        "version": service_node.attrib.get("version", "")
-                        if service_node is not None
-                        else "",
-                        "extrainfo": service_node.attrib.get("extrainfo", "")
-                        if service_node is not None
-                        else "",
-                        "tunnel": service_node.attrib.get("tunnel", "")
-                        if service_node is not None
-                        else "",
+                        "name": _sanitize(
+                            service_node.attrib.get("name") if service_node is not None else None,
+                            max_len=64,
+                        ),
+                        "product": _sanitize(
+                            service_node.attrib.get("product")
+                            if service_node is not None
+                            else None,
+                            max_len=200,
+                        ),
+                        "version": _sanitize(
+                            service_node.attrib.get("version")
+                            if service_node is not None
+                            else None,
+                            max_len=200,
+                        ),
+                        "extrainfo": _sanitize(
+                            service_node.attrib.get("extrainfo")
+                            if service_node is not None
+                            else None,
+                            max_len=200,
+                        ),
+                        "tunnel": _sanitize(
+                            service_node.attrib.get("tunnel") if service_node is not None else None,
+                            max_len=32,
+                        ),
                     },
                     "scripts": script_rows,
                 }
@@ -185,15 +223,15 @@ def parse_nmap_xml(xml_path: Path) -> dict:
         for match in host_node.findall("./os/osmatch")[:MAX_OS_MATCHES]:
             classes = [
                 {
-                    key: str(class_node.attrib.get(key) or "")[:200]
+                    key: _sanitize(class_node.attrib.get(key), max_len=200)
                     for key in ("type", "vendor", "osfamily", "osgen", "accuracy")
                 }
                 for class_node in match.findall("osclass")[:16]
             ]
             os_matches.append(
                 {
-                    "name": str(match.attrib.get("name") or "")[:500],
-                    "accuracy": str(match.attrib.get("accuracy") or "")[:20],
+                    "name": _sanitize(match.attrib.get("name"), max_len=500),
+                    "accuracy": _sanitize(match.attrib.get("accuracy"), max_len=20),
                     "classes": classes,
                 }
             )
@@ -201,14 +239,14 @@ def parse_nmap_xml(xml_path: Path) -> dict:
         trace = None
         if trace_node is not None:
             trace = {
-                "port": str(trace_node.attrib.get("port") or "")[:20],
-                "protocol": str(trace_node.attrib.get("proto") or "")[:20],
+                "port": _sanitize(trace_node.attrib.get("port"), max_len=20),
+                "protocol": _sanitize(trace_node.attrib.get("proto"), max_len=20),
                 "hops": [
                     {
-                        "ttl": str(hop.attrib.get("ttl") or "")[:20],
-                        "ip": str(hop.attrib.get("ipaddr") or "")[:200],
-                        "rtt": str(hop.attrib.get("rtt") or "")[:40],
-                        "host": str(hop.attrib.get("host") or "")[:500],
+                        "ttl": _sanitize(hop.attrib.get("ttl"), max_len=20),
+                        "ip": _sanitize(hop.attrib.get("ipaddr"), max_len=200),
+                        "rtt": _sanitize(hop.attrib.get("rtt"), max_len=40),
+                        "host": _sanitize(hop.attrib.get("host"), max_len=500),
                     }
                     for hop in trace_node.findall("hop")[:MAX_TRACE_HOPS]
                 ],
@@ -216,9 +254,11 @@ def parse_nmap_xml(xml_path: Path) -> dict:
 
         host = {
             "id": "",
-            "status": status_node.attrib.get("state", "unknown")
-            if status_node is not None
-            else "unknown",
+            "status": _sanitize(
+                status_node.attrib.get("state") if status_node is not None else None,
+                max_len=32,
+            )
+            or "unknown",
             "addresses": addresses,
             "hostnames": hostnames,
             "ports": sorted(ports, key=lambda item: (item["protocol"], item["port"])),
@@ -232,11 +272,11 @@ def parse_nmap_xml(xml_path: Path) -> dict:
     open_ports = sum(1 for host in hosts for port in host["ports"] if port["state"] == "open")
     return {
         "schema": SCHEMA_VERSION,
-        "scanner": root.attrib.get("scanner", "nmap"),
-        "nmap_version": root.attrib.get("version", ""),
-        "xmloutputversion": root.attrib.get("xmloutputversion", ""),
-        "started_at_epoch": root.attrib.get("start", ""),
-        "raw_args": root.attrib.get("args", ""),
+        "scanner": _sanitize(root.attrib.get("scanner"), max_len=32) or "nmap",
+        "nmap_version": _sanitize(root.attrib.get("version"), max_len=64),
+        "xmloutputversion": _sanitize(root.attrib.get("xmloutputversion"), max_len=32),
+        "started_at_epoch": _sanitize(root.attrib.get("start"), max_len=64),
+        "raw_args": _sanitize(root.attrib.get("args"), max_len=500),
         "stats": {
             "hosts": len(hosts),
             "hosts_up": sum(1 for host in hosts if host["status"] == "up"),
@@ -470,7 +510,10 @@ def create_artifacts(xml_path: Path, out_dir: Path, manifest_extra: dict = None)
         },
     }
     if manifest_extra:
-        manifest.update(manifest_extra)
+        for key, value in manifest_extra.items():
+            if key in ("schema", "artifacts", "stats", "generated_at"):
+                continue
+            manifest[key] = value
 
     write_json(manifest_path, manifest)
     return manifest
@@ -509,7 +552,7 @@ def run_scan(args: argparse.Namespace) -> int:
     command.extend(["-oX", str(xml_path), "-oN", str(normal_path), args.target])
 
     try:
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 - argv-only, shell=False
             command,
             check=False,
             timeout=args.scan_timeout,

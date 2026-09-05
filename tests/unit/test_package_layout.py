@@ -20,7 +20,7 @@ class PackageLayoutTests(unittest.TestCase):
         from recon_operator import server
 
         self.assertIs(autonmap, server)
-        self.assertEqual(autonmap.VERSION, "1.11.2")
+        self.assertEqual(autonmap.VERSION, "1.12.1")
         self.assertIs(autonmap.app, server.app)
 
     def test_package_surfaces_reexport_server_symbols(self):

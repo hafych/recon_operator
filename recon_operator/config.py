@@ -14,13 +14,13 @@ import os
 import uuid
 from importlib import import_module
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "1.11.2"
+VERSION = "1.12.1"
 SCAN_LOG_PATH = os.getenv("SCAN_LOG_PATH", "/app/logs/scan_log.txt")
 RESULTS_DIR = os.getenv("RESULTS_DIR", "encrypted_results")
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -49,8 +49,8 @@ STRUCTURED_LOGS = _parse_bool_env("STRUCTURED_LOGS", False)
 def _parse_int_env(
     name: str,
     default: int,
-    min_value: Optional[int] = None,
-    max_value: Optional[int] = None,
+    min_value: int | None = None,
+    max_value: int | None = None,
 ) -> int:
     value = os.getenv(name)
     if value is None:
@@ -93,9 +93,9 @@ RATE_LIMIT_INCLUDE_OWNER = _parse_bool_env("RATE_LIMIT_INCLUDE_OWNER", True)
 TRUSTED_PROXY_MODE = _parse_bool_env("TRUSTED_PROXY_MODE", False)
 
 
-def _load_trusted_proxies() -> List[str]:
+def _load_trusted_proxies() -> list[str]:
     """Load proxy peer allowlist (IPs or CIDRs). Empty when proxy mode is off."""
-    entries: List[str] = []
+    entries: list[str] = []
     raw = os.getenv("TRUSTED_PROXIES", "").strip()
     if raw:
         if raw.startswith("["):
@@ -113,7 +113,7 @@ def _load_trusted_proxies() -> List[str]:
         else:
             entries.extend(part.strip() for part in raw.split(",") if part.strip())
 
-    unique: List[str] = []
+    unique: list[str] = []
     seen = set()
     for entry in entries:
         try:
@@ -192,23 +192,32 @@ RESULTS_MAX_AGE_DAYS = _parse_int_env(
     "RESULTS_MAX_AGE_DAYS", default=0, min_value=0, max_value=3650
 )
 # When false, result files without an owner prefix (pre-1.7 legacy) are hidden
-# from all operators. Prefer false for multi-token / semi-public deploys.
-LEGACY_RESULTS_SHARED = _parse_bool_env("LEGACY_RESULTS_SHARED", True)
+# from all operators. Default false = secure multi-token. Set true only for
+# single-operator compat with pre-1.7 files.
+LEGACY_RESULTS_SHARED = _parse_bool_env("LEGACY_RESULTS_SHARED", False)
+# When false, job/task rows without an owner (pre-1.7 legacy) are hidden from
+# operators and cannot be cancelled by them. Default false = secure.
+LEGACY_JOBS_SHARED = _parse_bool_env("LEGACY_JOBS_SHARED", False)
+# 16 MiB: nmap XML imports are capped well below the request body limit to
+# bound XML parse time and memory on untrusted uploads.
+# When true, Telegram notifications include the scan target. Default false:
+# notification channels may be more broadly observable than the operator UI.
+TELEGRAM_INCLUDE_TARGET = _parse_bool_env("TELEGRAM_INCLUDE_TARGET", False)
 MAX_IMPORT_XML_BYTES = _parse_int_env(
-    "MAX_IMPORT_XML_BYTES", default=64 * 1024 * 1024, min_value=1024, max_value=64 * 1024 * 1024
+    "MAX_IMPORT_XML_BYTES", default=16 * 1024 * 1024, min_value=1024, max_value=64 * 1024 * 1024
 )
 STATE_DB_PATH = (
     os.getenv("STATE_DB_PATH", "data/recon_operator.db").strip() or "data/recon_operator.db"
 )
 
 
-def _load_target_allowlist() -> List[str]:
+def _load_target_allowlist() -> list[str]:
     """Load engagement-scope allowlist from env and optional file.
 
     Empty list means unrestricted (backward compatible). Entries may be IPs,
     CIDRs, exact hostnames, or ``*.example.com`` wildcard suffixes.
     """
-    entries: List[str] = []
+    entries: list[str] = []
     raw = os.getenv("TARGET_ALLOWLIST", "").strip()
     if raw:
         if raw.startswith("["):
@@ -239,7 +248,7 @@ def _load_target_allowlist() -> List[str]:
                 continue
             entries.append(line)
 
-    unique: List[str] = []
+    unique: list[str] = []
     seen = set()
     for entry in entries:
         key = entry.lower()

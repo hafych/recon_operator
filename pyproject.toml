@@ -4,11 +4,12 @@ line-length = 100
 exclude = [".git", ".venv"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I", "B"]
-ignore = ["B904"]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "S"]
+ignore = ["B904", "S101"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["B017"]
+"tests/**/*.py" = ["B017", "S101", "S105", "S106", "S108", "S110", "S310", "S603"]
+"tests/e2e/**/*.py" = ["B017", "S101", "S105", "S106", "S108", "S110", "S310", "S603"]
 
 [tool.coverage.run]
 branch = true
@@ -29,3 +30,10 @@ source = [
 show_missing = true
 skip_covered = true
 fail_under = 75
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+disallow_untyped_defs = false
+warn_unused_ignores = true
+exclude = ["\\.venv/", "tests/"]

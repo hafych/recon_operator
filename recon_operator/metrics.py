@@ -9,16 +9,17 @@ from __future__ import annotations
 import threading
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 
-def _labels_key(labels: Optional[Mapping[str, str]]) -> Tuple[Tuple[str, str], ...]:
+def _labels_key(labels: Mapping[str, str] | None) -> tuple[tuple[str, str], ...]:
     if not labels:
         return ()
     return tuple(sorted((str(k), str(v)) for k, v in labels.items()))
 
 
-def _format_labels(labels: Tuple[Tuple[str, str], ...]) -> str:
+def _format_labels(labels: tuple[tuple[str, str], ...]) -> str:
     if not labels:
         return ""
     parts = [f'{k}="{_escape_label(v)}"' for k, v in labels]
@@ -30,7 +31,7 @@ def _escape_label(value: str) -> str:
 
 
 # Default duration buckets (seconds) for scan runtime histogram.
-DEFAULT_DURATION_BUCKETS: Tuple[float, ...] = (
+DEFAULT_DURATION_BUCKETS: tuple[float, ...] = (
     1.0,
     5.0,
     15.0,
@@ -49,13 +50,13 @@ class MetricsRegistry:
 
     def __init__(self, duration_buckets: Sequence[float] = DEFAULT_DURATION_BUCKETS) -> None:
         self._lock = threading.Lock()
-        self._counters: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = defaultdict(float)
-        self._gauges: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = {}
-        self._histograms: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], Dict[str, Any]] = {}
+        self._counters: dict[tuple[str, tuple[tuple[str, str], ...]], float] = defaultdict(float)
+        self._gauges: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
+        self._histograms: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
         self._duration_buckets = tuple(sorted(float(b) for b in duration_buckets))
         self._started_at = time.time()
         # HELP/TYPE metadata for known series.
-        self._meta: Dict[str, Tuple[str, str]] = {
+        self._meta: dict[str, tuple[str, str]] = {
             "recon_operator_info": ("gauge", "Constant 1 labeled with product version"),
             "recon_operator_up": ("gauge", "1 when the metrics process is up"),
             "recon_operator_jobs_created_total": (
@@ -140,11 +141,11 @@ class MetricsRegistry:
     def render_prometheus(
         self,
         *,
-        extra_gauges: Optional[Mapping[Tuple[str, Tuple[Tuple[str, str], ...]], float]] = None,
-        info_labels: Optional[Mapping[str, str]] = None,
+        extra_gauges: Mapping[tuple[str, tuple[tuple[str, str], ...]], float] | None = None,
+        info_labels: Mapping[str, str] | None = None,
     ) -> str:
         """Render Prometheus text exposition format (0.0.4)."""
-        lines: List[str] = []
+        lines: list[str] = []
         emitted_help: set = set()
 
         def ensure_meta(name: str) -> None:

@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -87,8 +87,15 @@ class StateStore:
     def __init__(self, path: str):
         self.path = str(path)
         self._lock = threading.Lock()
-        self._memory_uri: Optional[str] = None
-        self._memory_keeper: Optional[sqlite3.Connection] = None
+        self._memory_uri: str | None = None
+        self._memory_keeper: sqlite3.Connection | None = None
+        # Restrict process-wide file creation so SQLite-created sidecar files
+        # (-wal/-shm) are never born world-readable. Operators may override via
+        # the UMASK environment variable (octal, e.g. 077).
+        try:
+            os.umask(int(os.getenv("UMASK", "077"), 8))
+        except (TypeError, ValueError):
+            os.umask(0o077)
         if self.path == ":memory:":
             self._memory_uri = f"file:recon_operator_{uuid.uuid4().hex}?mode=memory&cache=shared"
             self._memory_keeper = sqlite3.connect(
@@ -99,10 +106,7 @@ class StateStore:
             )
             self._configure_connection(self._memory_keeper)
         else:
-            parent = Path(self.path).parent
-            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            Path(self.path).touch(mode=0o600, exist_ok=True)
-            os.chmod(self.path, 0o600)
+            self._prepare_private_db_file()
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             # Serialize schema inspection + DDL across documented multi-worker
@@ -113,6 +117,47 @@ class StateStore:
             # Purge plaintext rows left by older releases.
             conn.execute("UPDATE scan_jobs SET result_json = NULL WHERE result_json IS NOT NULL")
             conn.commit()
+
+    def _prepare_private_db_file(self) -> None:
+        """Create the state DB with owner-only permissions, race-safe.
+
+        ``os.open`` with ``O_NOFOLLOW`` refuses symlinked paths (preventing a
+        swap-on-create attack) and creates the file with the requested mode in
+        one atomic step, so no window exists between creation and chmod.
+        """
+        parent = Path(self.path).parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            parent.chmod(0o700)
+        except OSError:
+            pass
+        try:
+            descriptor = os.open(
+                self.path,
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"Unable to create state DB at {self.path}: {exc}") from exc
+        try:
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
+    def _enforce_private_permissions(self) -> None:
+        """Re-apply owner-only permissions to the DB and its WAL sidecars.
+
+        SQLite creates ``-wal``/``-shm`` lazily on the first write, after any
+        earlier chmod pass. The process-wide umask covers initial creation;
+        this repairs files that exist or were widened in between.
+        """
+        for suffix in ("", "-wal", "-shm"):
+            candidate = f"{self.path}{suffix}"
+            try:
+                if os.path.lexists(candidate):
+                    os.chmod(candidate, 0o600)
+            except OSError:
+                continue
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -130,12 +175,8 @@ class StateStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA secure_delete=ON")
-        if self._memory_uri is not None:
-            return
-        for suffix in ("", "-wal", "-shm"):
-            candidate = f"{self.path}{suffix}"
-            if os.path.exists(candidate):
-                os.chmod(candidate, 0o600)
+        if self._memory_uri is None:
+            self._enforce_private_permissions()
 
     def close(self) -> None:
         """Release the keeper used by shared ``:memory:`` stores."""
@@ -146,11 +187,11 @@ class StateStore:
     def __del__(self):
         try:
             self.close()
-        except Exception:
+        except Exception:  # noqa: S110 - destructor must not raise
             pass
 
     @staticmethod
-    def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
         return [row["name"] for row in rows]
 
@@ -181,10 +222,10 @@ class StateStore:
         scan_type: str,
         interval_minutes: float,
         *,
-        ports: Optional[str] = None,
-        scripts: Optional[str] = None,
-        discovery: Optional[str] = None,
-        owner_id: Optional[str] = None,
+        ports: str | None = None,
+        scripts: str | None = None,
+        discovery: str | None = None,
+        owner_id: str | None = None,
         created_at: str,
     ) -> None:
         with self._lock, self._connect() as conn:
@@ -223,24 +264,39 @@ class StateStore:
             conn.commit()
             return cursor.rowcount > 0
 
-    def list_scheduled_tasks(self, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_scheduled_tasks(
+        self,
+        owner_id: str | None = None,
+        *,
+        legacy_shared: bool = True,
+    ) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             if owner_id:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM scheduled_tasks
-                    WHERE owner_id IS NULL OR owner_id = ?
-                    ORDER BY created_at ASC
-                    """,
-                    (owner_id,),
-                ).fetchall()
+                if legacy_shared:
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM scheduled_tasks
+                        WHERE owner_id IS NULL OR owner_id = ?
+                        ORDER BY created_at ASC
+                        """,
+                        (owner_id,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM scheduled_tasks
+                        WHERE owner_id = ?
+                        ORDER BY created_at ASC
+                        """,
+                        (owner_id,),
+                    ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT * FROM scheduled_tasks ORDER BY created_at ASC"
                 ).fetchall()
         return [dict(row) for row in rows]
 
-    def upsert_job(self, job: Dict[str, Any]) -> None:
+    def upsert_job(self, job: dict[str, Any]) -> None:
         """Compatibility full-row upsert without persisting plaintext results.
 
         Runtime state-machine transitions should use the conditional helpers
@@ -293,7 +349,7 @@ class StateStore:
             )
             conn.commit()
 
-    def insert_job(self, job: Dict[str, Any]) -> None:
+    def insert_job(self, job: dict[str, Any]) -> None:
         """Insert a newly queued job; fail if durable acceptance is impossible."""
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -327,11 +383,11 @@ class StateStore:
 
     def insert_job_with_capacity(
         self,
-        job: Dict[str, Any],
+        job: dict[str, Any],
         *,
         max_active: int,
         dedupe_active: bool = False,
-    ) -> tuple[Optional[Dict[str, Any]], bool]:
+    ) -> tuple[dict[str, Any] | None, bool]:
         """Atomically enforce global capacity and optionally reuse an active match.
 
         Returns ``(job, inserted)``. ``job`` is ``None`` when capacity is full.
@@ -418,7 +474,7 @@ class StateStore:
         worker_id: str,
         *,
         started_at: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Move a job from leased/queued to running under the same lease."""
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
@@ -446,9 +502,9 @@ class StateStore:
         *,
         status: str,
         finished_at: str,
-        error: Optional[str],
-        result_file: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
+        error: str | None,
+        result_file: str | None = None,
+    ) -> dict[str, Any] | None:
         """Atomically commit a terminal state while the caller still owns the job."""
         if status not in {"completed", "failed", "cancelled", "timeout"}:
             raise ValueError(f"Invalid terminal job status: {status}")
@@ -482,10 +538,14 @@ class StateStore:
         *,
         finished_at: str,
         error: str,
-    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        legacy_shared: bool = True,
+    ) -> tuple[dict[str, Any] | None, bool]:
         """Cancel an owned queued/running job without overwriting terminal state."""
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            # When legacy_shared is true, rows without an owner (pre-1.7) are
+            # cancellable by any operator. Expressed with parameters only; the
+            # boolean is passed as an integer bind so no SQL is assembled.
             cursor = conn.execute(
                 """
                 UPDATE scan_jobs
@@ -496,17 +556,17 @@ class StateStore:
                     lease_owner = NULL,
                     lease_until = NULL
                 WHERE job_id = ?
-                  AND (owner_id IS NULL OR owner_id = ?)
+                  AND (owner_id = ? OR (? = 1 AND owner_id IS NULL))
                   AND status IN ('queued', 'running')
                 """,
-                (finished_at, error, job_id, owner_id),
+                (finished_at, error, job_id, owner_id, int(bool(legacy_shared))),
             )
             row = conn.execute(
                 """
                 SELECT * FROM scan_jobs
-                WHERE job_id = ? AND (owner_id IS NULL OR owner_id = ?)
+                WHERE job_id = ? AND (owner_id = ? OR (? = 1 AND owner_id IS NULL))
                 """,
-                (job_id, owner_id),
+                (job_id, owner_id, int(bool(legacy_shared))),
             ).fetchone()
             conn.commit()
         return (
@@ -534,25 +594,51 @@ class StateStore:
             conn.commit()
             return cursor.rowcount > 0
 
-    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+    def get_job(self, job_id: str, owner_id: str | None = None) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
-            row = conn.execute("SELECT * FROM scan_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if owner_id:
+                row = conn.execute(
+                    """
+                    SELECT * FROM scan_jobs
+                    WHERE job_id = ? AND (owner_id IS NULL OR owner_id = ?)
+                    """,
+                    (job_id, owner_id),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM scan_jobs WHERE job_id = ?", (job_id,)).fetchone()
         if row is None:
             return None
         return self._row_to_job(dict(row))
 
-    def list_jobs(self, limit: int = 200, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_jobs(
+        self,
+        limit: int = 200,
+        owner_id: str | None = None,
+        *,
+        legacy_shared: bool = True,
+    ) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             if owner_id:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM scan_jobs
-                    WHERE owner_id IS NULL OR owner_id = ?
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                    """,
-                    (owner_id, max(1, int(limit))),
-                ).fetchall()
+                if legacy_shared:
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM scan_jobs
+                        WHERE owner_id IS NULL OR owner_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                        """,
+                        (owner_id, max(1, int(limit))),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM scan_jobs
+                        WHERE owner_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                        """,
+                        (owner_id, max(1, int(limit))),
+                    ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT * FROM scan_jobs ORDER BY created_at DESC LIMIT ?",
@@ -583,10 +669,18 @@ class StateStore:
             conn.commit()
             return max(0, cursor.rowcount)
 
-    def delete_job(self, job_id: str) -> None:
+    def delete_job(self, job_id: str) -> bool:
+        """Delete a terminal job row; refuse to hard-delete active jobs."""
         with self._lock, self._connect() as conn:
-            conn.execute("DELETE FROM scan_jobs WHERE job_id = ?", (job_id,))
+            cursor = conn.execute(
+                """
+                DELETE FROM scan_jobs
+                WHERE job_id = ? AND status NOT IN ('queued', 'running')
+                """,
+                (job_id,),
+            )
             conn.commit()
+            return cursor.rowcount > 0
 
     def try_claim_job(
         self,
@@ -596,7 +690,7 @@ class StateStore:
         now: float,
         lease_seconds: float,
         started_at: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Atomically lease a queued (or expired-running) job for ``worker_id``."""
         lease_until = float(now) + float(lease_seconds)
         with self._lock, self._connect() as conn:
@@ -640,7 +734,7 @@ class StateStore:
         now: float,
         lease_seconds: float,
         started_at: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Claim the oldest claimable job in one cross-process transaction."""
         lease_until = float(now) + float(lease_seconds)
         with self._lock, self._connect() as conn:
@@ -764,7 +858,7 @@ class StateStore:
             ).fetchone()
             return bool(row and row["owner_id"] == worker_id)
 
-    def get_leader(self, lock_name: str) -> Optional[Dict[str, Any]]:
+    def get_leader(self, lock_name: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT lock_name, owner_id, lease_until FROM leadership WHERE lock_name = ?",
@@ -780,23 +874,37 @@ class StateStore:
             )
             conn.commit()
 
+    @staticmethod
+    def _bounded(value: str | None, limit: int) -> str | None:
+        """Truncate a free-text field; empty results become NULL."""
+        if value is None:
+            return None
+        text = str(value)
+        if len(text) > limit:
+            text = text[:limit]
+        return text or None
+
     def append_audit_event(
         self,
         *,
         ts: str,
         action: str,
-        actor_key_id: Optional[str] = None,
-        actor_owner_prefix: Optional[str] = None,
-        target: Optional[str] = None,
-        scan_type: Optional[str] = None,
-        job_id: Optional[str] = None,
-        task_id: Optional[str] = None,
-        result_file: Optional[str] = None,
-        status: Optional[str] = None,
-        detail: Optional[str] = None,
+        actor_key_id: str | None = None,
+        actor_owner_prefix: str | None = None,
+        target: str | None = None,
+        scan_type: str | None = None,
+        job_id: str | None = None,
+        task_id: str | None = None,
+        result_file: str | None = None,
+        status: str | None = None,
+        detail: str | None = None,
         max_events: int = 10_000,
     ) -> None:
-        """Append an audit event and prune oldest rows beyond max_events."""
+        """Append an audit event and prune oldest rows beyond max_events.
+
+        Field lengths are bounded at the storage layer so direct callers
+        cannot bloat or poison the audit log.
+        """
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
@@ -807,24 +915,28 @@ class StateStore:
                 """,
                 (
                     ts,
-                    action,
-                    actor_key_id,
-                    actor_owner_prefix,
-                    target,
-                    scan_type,
-                    job_id,
-                    task_id,
-                    result_file,
-                    status,
-                    detail,
+                    self._bounded(action, 64) or "",
+                    self._bounded(actor_key_id, 64),
+                    self._bounded(actor_owner_prefix, 16),
+                    self._bounded(target, 256),
+                    self._bounded(scan_type, 64),
+                    self._bounded(job_id, 64),
+                    self._bounded(task_id, 200),
+                    self._bounded(result_file, 260),
+                    self._bounded(status, 64),
+                    self._bounded(detail, 500),
                 ),
             )
             if max_events > 0:
+                # Single cutoff point: delete every row older than the Nth most
+                # recent. O(1) per append regardless of max_events, unlike the
+                # previous NOT IN set scan.
                 conn.execute(
                     """
                     DELETE FROM audit_events
-                    WHERE id NOT IN (
-                        SELECT id FROM audit_events ORDER BY id DESC LIMIT ?
+                    WHERE id <= COALESCE(
+                        (SELECT id FROM audit_events ORDER BY id DESC LIMIT 1 OFFSET ?),
+                        0
                     )
                     """,
                     (int(max_events),),
@@ -835,11 +947,11 @@ class StateStore:
         self,
         *,
         limit: int = 100,
-        action: Optional[str] = None,
-        actor_key_id: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        action: str | None = None,
+        actor_key_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 1000))
-        params: List[Any] = []
+        params: list[Any] = []
         if action and actor_key_id:
             query = """
                 SELECT id, ts, action, actor_key_id, actor_owner_prefix, target, scan_type,
@@ -884,7 +996,7 @@ class StateStore:
         return [dict(row) for row in rows]
 
     @staticmethod
-    def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
+    def _row_to_job(row: dict[str, Any]) -> dict[str, Any]:
         return {
             "job_id": row["job_id"],
             "target": row["target"],

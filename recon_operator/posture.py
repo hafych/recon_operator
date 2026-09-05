@@ -10,10 +10,10 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 
-def _normalize_host(value: Any) -> Optional[str]:
+def _normalize_host(value: Any) -> str | None:
     text = str(value or "").strip()
     if not text:
         return None
@@ -24,12 +24,12 @@ def _normalize_host(value: Any) -> Optional[str]:
 
 
 def _service_name_matches(expected: str, observed: str) -> bool:
-    return expected in {"unknown", "*"} or observed == "unknown" or expected == observed
+    return expected == "*" or expected == observed
 
 
-def _open_service_keys(scan: Dict[str, Any]) -> Set[Tuple[str, str, int, str]]:
+def _open_service_keys(scan: dict[str, Any]) -> set[tuple[str, str, int, str]]:
     """Return set of (host, proto, port, service_name) for open ports."""
-    found: Set[Tuple[str, str, int, str]] = set()
+    found: set[tuple[str, str, int, str]] = set()
     hosts = scan.get("hosts") if isinstance(scan, dict) else None
     if not isinstance(hosts, list):
         return found
@@ -60,10 +60,10 @@ def _open_service_keys(scan: Dict[str, Any]) -> Set[Tuple[str, str, int, str]]:
 
 
 def load_expected_posture(
-    raw: Optional[str] = None,
+    raw: str | None = None,
     *,
-    file_path: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+    file_path: str | None = None,
+) -> dict[str, Any] | None:
     """Load expected posture from explicit JSON, env, or file.
 
     Shape::
@@ -103,7 +103,7 @@ def load_expected_posture(
     deny_unexpected = parsed.get("deny_unexpected", True)
     if not isinstance(deny_unexpected, bool):
         raise RuntimeError("EXPECTED_POSTURE.deny_unexpected must be boolean")
-    normalized: List[Dict[str, Any]] = []
+    normalized: list[dict[str, Any]] = []
     for index, item in enumerate(services):
         if not isinstance(item, dict):
             raise RuntimeError(f"EXPECTED_POSTURE.services[{index}] must be an object")
@@ -133,11 +133,11 @@ def load_expected_posture(
 
 
 def evaluate_posture(
-    scan: Dict[str, Any],
-    expected: Optional[Dict[str, Any]],
+    scan: dict[str, Any],
+    expected: dict[str, Any] | None,
     *,
     max_rows: int = 40,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compare open services to expected posture.
 
     Returns summary + drift list::
@@ -161,13 +161,13 @@ def evaluate_posture(
     if not isinstance(expected_services, list):
         expected_services = []
 
-    drifts: List[Dict[str, Any]] = []
+    drifts: list[dict[str, Any]] = []
     # Missing expected services.
     for rule in expected_services:
         if not isinstance(rule, dict):
             continue
         port = int(rule["port"])
-        proto = str(rule.get("proto") or "tcp")
+        proto = str(rule.get("proto") or "tcp").lower()
         name = str(rule.get("name") or "unknown").lower()
         host_rule = rule.get("host")
         matched = False
@@ -197,7 +197,7 @@ def evaluate_posture(
 
     # Unexpected open services.
     if deny_unexpected:
-        expected_ports: Set[Tuple[Optional[str], str, int, str]] = set()
+        expected_ports: set[tuple[str | None, str, int, str]] = set()
         for rule in expected_services:
             if not isinstance(rule, dict):
                 continue
@@ -232,6 +232,7 @@ def evaluate_posture(
 
     unexpected = sum(1 for drift in drifts if drift.get("op") == "unexpected")
     missing = sum(1 for drift in drifts if drift.get("op") == "missing")
+    truncated = len(drifts) > max(0, int(max_rows))
     drifts = drifts[: max(0, int(max_rows))]
     return {
         "enabled": True,
@@ -241,20 +242,21 @@ def evaluate_posture(
         "unexpected": unexpected,
         "missing": missing,
         "drifts": drifts,
+        "truncated": truncated,
     }
 
 
 def posture_pack_rows(
-    scan: Dict[str, Any],
-    expected: Optional[Dict[str, Any]],
+    scan: dict[str, Any],
+    expected: dict[str, Any] | None,
     *,
     max_rows: int = 12,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Rows suitable for inclusion in an AI pack."""
     report = evaluate_posture(scan, expected, max_rows=max_rows)
     if not report.get("enabled"):
         return []
-    rows: List[Dict[str, Any]] = [
+    rows: list[dict[str, Any]] = [
         {
             "t": "posture",
             "expected": report["expected_count"],
@@ -262,6 +264,7 @@ def posture_pack_rows(
             "unexpected": report["unexpected"],
             "missing": report["missing"],
             "deny_unexpected": report["deny_unexpected"],
+            "truncated": bool(report.get("truncated")),
         }
     ]
     rows.extend(report.get("drifts") or [])

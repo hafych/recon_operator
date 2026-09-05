@@ -22,6 +22,8 @@ services:
       - scan-state:/app/data
     restart: unless-stopped
     stop_grace_period: 40s
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
 
@@ -30,8 +32,10 @@ services:
   # Then set REDIS_URL=redis://redis:6379/0 in .env
   redis:
     profiles: ["redis"]
-    # Multi-arch manifest digest for redis:7-alpine (refresh periodically).
-    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    # 7-alpine tracks unmaintained 7.4 (no July 2026 patches). Use 8-alpine (patched 2026-07-24).
+    # Pin digest after `docker pull redis:8-alpine` (multi-arch manifest), e.g.:
+    # image: redis:8-alpine@sha256:<digest-from-docker-pull>
+    image: redis:8-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "127.0.0.1:6379:6379"
@@ -39,6 +43,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
 

@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Sequence, Union
+from collections.abc import Sequence
 
 from cryptography.fernet import Fernet, MultiFernet
 
 
-def _parse_key_list(raw: str) -> List[str]:
+def _parse_key_list(raw: str) -> list[str]:
     raw = (raw or "").strip()
     if not raw:
         return []
@@ -30,7 +30,7 @@ def _parse_key_list(raw: str) -> List[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def load_fernet_key_material() -> List[str]:
+def load_fernet_key_material() -> list[str]:
     """Load primary + previous Fernet keys from the environment.
 
     Returns a non-empty list with the primary key first. Raises RuntimeError
@@ -44,7 +44,7 @@ def load_fernet_key_material() -> List[str]:
         )
     previous = _parse_key_list(os.getenv("FERNET_PREVIOUS_KEYS", ""))
     # Deduplicate while preserving order (primary first).
-    ordered: List[str] = []
+    ordered: list[str] = []
     seen = set()
     for key in [primary, *previous]:
         if key in seen:
@@ -63,7 +63,7 @@ def load_fernet_key_material() -> List[str]:
     return ordered
 
 
-def build_fernet_cipher(keys: Sequence[str] | None = None) -> Union[Fernet, MultiFernet]:
+def build_fernet_cipher(keys: Sequence[str] | None = None) -> Fernet | MultiFernet:
     """Build a cipher that encrypts with the first key and decrypts with all.
 
     Single-key deployments return a plain ``Fernet`` instance so existing
